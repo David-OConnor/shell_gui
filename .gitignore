@@ -1,0 +1,11 @@
+# IDE
+*.iws
+.idea/workspace.xml
+
+/target
+Cargo.lock
+
+.claude
+
+# This application's save data
+*.ss

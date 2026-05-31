@@ -1,0 +1,12 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.44"
+#rustyline = "18.0.0"
+
+egui = "0.34.1"
+eframe = "0.34.1"
+#egui-file-dialog = "0.13.0" #  For file dialogs.
