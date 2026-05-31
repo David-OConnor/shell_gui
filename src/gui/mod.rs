@@ -2,6 +2,7 @@ use egui::{
     Align, Button, CentralPanel, Color32, ComboBox, DragValue, Layout, ScrollArea, TextEdit, Ui,
     vec2,
 };
+
 use crate::State;
 
 pub const WINDOW_WIDTH: f32 = 1200.;
@@ -40,10 +41,16 @@ fn cmd_history(state: &mut State, ui: &mut Ui) {
     }
 }
 
-fn primary_text_entry(state: &mut State, ui: &mut Ui) {
-    ui.text_edit_multiline(
-        &mut state.cli_input,
-    );
+/// Equivalent to the bulk of content in a CLI/ternimal: Stdout/err etc.
+fn term_out(state: &mut State, ui: &mut Ui) {
+    for item in &state.ui.out {
+        // todo A/R
+    }
+}
+
+/// Equivalent to the entry line of a CLI/terminal.
+fn term_in(state: &mut State, ui: &mut Ui) {
+    ui.text_edit_multiline(&mut state.ui.cli_input);
 }
 
 pub fn draw(state: &mut State, ui: &mut Ui) {
@@ -52,11 +59,10 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
         dir_history(state, ui);
         cmd_history(state, ui);
 
-        primary_text_entry(state, ui);
-
+        term_out(state, ui);
+        term_in(state, ui);
 
         ui.label("Compositions");
-
     });
 
     // handle_file_dialogs(state, ui);

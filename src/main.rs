@@ -1,7 +1,7 @@
+mod gui;
 mod save_data;
 mod tasks;
 mod util;
-mod gui;
 
 use std::{
     env, io,
@@ -11,6 +11,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+
 use crate::gui::{WINDOW_HEIGHT, WINDOW_WIDTH};
 
 // Display this many history items at a time.
@@ -28,11 +29,30 @@ struct RecentDir {
     pub dt: DateTime<Utc>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum OutType {
+    StdOut,
+    StdErr,
+}
+
+/// E.g. std out/err
+pub struct OutItem {
+    pub text: String,
+    pub type_: OutType,
+    pub dt: DateTime<Utc>,
+}
+
+/// State specific to the GUI.
+pub struct StateUi {
+    /// The current text the user has typed, pasted etc.
+    pub cli_input: String,
+    pub out: Vec<OutItem>,
+}
+
 // todo: Instead of storing these Arc<Mutex>>s, perhaps we do it some other way; this is due
 // todo: due to how Rustyline expects it.
 struct State {
-    /// The current text the user has typed, pasted etc.
-    pub cli_input: String,
+    pub ui: StateUi,
     /// Cached.
     pub home: Option<PathBuf>,
     /// Shared with the Ctrl+H / arrow-key handlers, which render pages of
