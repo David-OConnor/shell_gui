@@ -1,3 +1,4 @@
+mod ansi;
 mod gui;
 mod tasks;
 
@@ -188,7 +189,7 @@ pub fn run_command(state: &mut State, input: &str) {
     // Echo the prompt + command into the output pane so the user can see
     // what they ran (mirrors how a normal terminal scrolls).
     let prompt = state.prompt();
-    state.push_out(format!("{prompt}{input}"), OutType::Prompt);
+    state.push_out(format!("{prompt}> {input}"), OutType::Prompt);
 
     let (cmd, args) = match input.find(char::is_whitespace) {
         Some(i) => (&input[..i], input[i..].trim()),

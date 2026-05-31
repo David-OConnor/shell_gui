@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use egui::{CentralPanel, Color32, Frame, Key, Panel, RichText, ScrollArea, TextEdit, Ui};
 
-use crate::{OutType, State, render_with_tilde, run_command};
+use crate::{OutType, State, ansi, render_with_tilde, run_command};
 
 pub const WINDOW_WIDTH: f32 = 1400.;
 pub const WINDOW_HEIGHT: f32 = 900.;
@@ -140,8 +140,9 @@ fn term_out(state: &mut State, ui: &mut Ui) {
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
             for item in &state.ui.out {
-                let color = match item.type_ {
+                let default_color = match item.type_ {
                     OutType::Prompt => COLOR_PROMPT,
                     OutType::StdOut => COLOR_STDOUT,
                     OutType::StdErr => COLOR_STDERR,
@@ -149,7 +150,9 @@ fn term_out(state: &mut State, ui: &mut Ui) {
                 // Trim a trailing newline so blank rows don't accumulate
                 // (Command output usually ends with one).
                 let text = item.text.trim_end_matches('\n');
-                ui.label(RichText::new(text).color(color).monospace());
+                let segments = ansi::parse(text);
+                let job = ansi::to_layout_job(&segments, default_color, mono_font.clone());
+                ui.label(job);
             }
         });
 }
