@@ -1,120 +1,151 @@
 mod gui;
-mod save_data;
 mod tasks;
-mod util;
 
 use std::{
     env, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
 
+use shell::{RecentDir, get_home, path_from_args, save_data};
+
 use crate::gui::{WINDOW_HEIGHT, WINDOW_WIDTH};
 
-// Display this many history items at a time.
-const DISP_HIST_LEN: usize = 20;
-
-struct HistoryItem {
+pub struct HistoryItem {
     pub text: String,
-    pub dt: DateTime<Utc>,
-}
-
-struct RecentDir {
-    pub path: PathBuf,
     pub dt: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum OutType {
+    Prompt,
     StdOut,
     StdErr,
 }
 
-/// E.g. std out/err
+/// One line / chunk of terminal output. Lines from the same command are kept
+/// as separate items so they can be coloured by stream.
 pub struct OutItem {
     pub text: String,
     pub type_: OutType,
     pub dt: DateTime<Utc>,
 }
 
-/// State specific to the GUI.
+/// State specific to the GUI: the current input buffer, the captured terminal
+/// output, and a "please focus the input next frame" flag we use after
+/// running a command so the user can keep typing.
 pub struct StateUi {
-    /// The current text the user has typed, pasted etc.
     pub cli_input: String,
     pub out: Vec<OutItem>,
+    /// Set when something programmatic should pull keyboard focus to the
+    /// input box on the next frame (e.g. just after running a command).
+    pub focus_input: bool,
 }
 
-// todo: Instead of storing these Arc<Mutex>>s, perhaps we do it some other way; this is due
-// todo: due to how Rustyline expects it.
-struct State {
+impl Default for StateUi {
+    fn default() -> Self {
+        Self {
+            cli_input: String::new(),
+            out: Vec::new(),
+            focus_input: true,
+        }
+    }
+}
+
+pub struct State {
     pub ui: StateUi,
     /// Cached.
     pub home: Option<PathBuf>,
-    /// Shared with the Ctrl+H / arrow-key handlers, which render pages of
-    /// recent commands without holding `State`.
     pub history: Vec<HistoryItem>,
     /// This initializes to env::current_dir, but is then managed from within
     /// this program.
     pub cwd: PathBuf,
     /// User-controlled list of directory bookmarks that can be easily
-    /// navigated to. Shared with the readline key handler (Ctrl+B), which
-    /// is why it lives behind an Arc<Mutex<_>>.
+    /// navigated to.
     pub dir_bookmarks: Vec<PathBuf>,
     /// Paths we've execute commands from. Works in a similar way to bookmarks.
     pub recent_dirs: Vec<RecentDir>,
+    /// Where bookmarks + recent dirs are persisted.
+    pub state_path: PathBuf,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            home: util::get_home(),
+            ui: StateUi::default(),
+            home: get_home(),
             history: Vec::new(),
             cwd: env::current_dir().unwrap_or_default(),
             dir_bookmarks: Vec::new(),
             recent_dirs: Vec::new(),
+            state_path: save_data::default_path()
+                .unwrap_or_else(|| PathBuf::from(save_data::FILENAME)),
         }
     }
 }
 
 impl State {
-    /// This defines what the general prompt looks like. Its adorning characters let the user know they're in this shell.
-    fn prompt(&self) -> String {
-        // Mark the directory with a leading `*` when it's bookmarked.
-        let bookmarked = self.dir_bookmarks;
-
+    /// Prompt prefix used when echoing a command into the output pane.
+    pub fn prompt(&self) -> String {
+        let bookmarked = self.dir_bookmarks.contains(&self.cwd);
         let star = if bookmarked { "*" } else { "" };
-        format!("S {star}{} $ ", self.cwd.display())
+        format!("{star}{}", self.cwd.display())
     }
 
-    /// Persist user-controlled state (bookmarks + recent dirs) to the given
-    /// file. Called after every mutation of either list. Locks bookmarks
-    /// before recent_dirs — keep this order consistent across all callers
-    /// to avoid lock-order deadlocks.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        save_data::save_state(&self.dir_bookmarks, &self.recent_dirs, path)
+    pub fn save(&self) -> io::Result<()> {
+        save_data::save_state(&self.dir_bookmarks, &self.recent_dirs, &self.state_path)
     }
 
-    /// Restore state from disk, returning a fresh `State` with that data.
-    /// A missing file is treated as "no saved state" and yields the default
-    /// `State::new()` values (not an error).
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let (bookmarks, recent_dirs) = save_data::load_state(path)?;
+    pub fn load(path: PathBuf) -> io::Result<Self> {
+        let (bookmarks, recent_dirs) = save_data::load_state(&path)?;
 
         Ok(Self {
-            home: util::get_home(),
+            ui: StateUi::default(),
+            home: get_home(),
             history: Vec::new(),
             cwd: env::current_dir().unwrap_or_default(),
-            dir_bookmarks,
+            dir_bookmarks: bookmarks,
             recent_dirs,
+            state_path: path,
         })
+    }
+
+    pub fn push_out(&mut self, text: impl Into<String>, type_: OutType) {
+        self.ui.out.push(OutItem {
+            text: text.into(),
+            type_,
+            dt: Utc::now(),
+        });
+    }
+
+    /// Toggle the current dir in the bookmark list. Returns the message we
+    /// surfaced to the user, so callers can echo it into the output pane.
+    pub fn toggle_bookmark_cwd(&mut self) -> String {
+        let cwd = self.cwd.clone();
+        if let Some(pos) = self.dir_bookmarks.iter().position(|p| p == &cwd) {
+            self.dir_bookmarks.remove(pos);
+            let _ = self.save();
+            format!("Removed bookmark: {}", cwd.display())
+        } else {
+            self.dir_bookmarks.push(cwd.clone());
+            let _ = self.save();
+            format!("Added a bookmark: {}", cwd.display())
+        }
+    }
+
+    /// `cd` to `target` and update cwd. Pushes a diagnostic on failure.
+    pub fn change_dir(&mut self, target: PathBuf) {
+        match env::set_current_dir(&target) {
+            Ok(_) => self.cwd = env::current_dir().unwrap_or(target),
+            Err(e) => self.push_out(format!("cd: {e}"), OutType::StdErr),
+        }
     }
 }
 
 impl eframe::App for State {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         gui::draw(self, ui);
     }
 }
@@ -122,7 +153,7 @@ impl eframe::App for State {
 /// Render a path as `~/relative` when it lives under the home directory;
 /// otherwise use the absolute form. Uses forward slashes after the tilde for
 /// consistency with the rest of the shell.
-fn render_with_tilde(p: &Path, home: Option<&Path>) -> String {
+pub fn render_with_tilde(p: &Path, home: Option<&Path>) -> String {
     if let Some(home) = home {
         if let Ok(rest) = p.strip_prefix(home) {
             let rest_str = rest.to_string_lossy().replace('\\', "/");
@@ -135,302 +166,241 @@ fn render_with_tilde(p: &Path, home: Option<&Path>) -> String {
     p.display().to_string()
 }
 
-impl ShellHelper {
-    fn render(&self, p: &Path) -> String {
-        render_with_tilde(p, self.home.as_deref())
-    }
-}
-
-/// Split a line into word ranges (byte start, byte end), treating quoted
-/// regions as part of the surrounding word so that spaces inside `"..."` or
-/// `'...'` don't break a token apart.
-fn tokenize_words(line: &str) -> Vec<(usize, usize)> {
-    let mut words = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut word_start: Option<usize> = None;
-
-    for (idx, ch) in line.char_indices() {
-        match quote {
-            Some(q) => {
-                if ch == q {
-                    quote = None;
-                }
-                if word_start.is_none() {
-                    word_start = Some(idx);
-                }
-            }
-            None => {
-                if ch == '"' || ch == '\'' {
-                    quote = Some(ch);
-                    if word_start.is_none() {
-                        word_start = Some(idx);
-                    }
-                } else if ch.is_whitespace() {
-                    if let Some(s) = word_start.take() {
-                        words.push((s, idx));
-                    }
-                } else if word_start.is_none() {
-                    word_start = Some(idx);
-                }
-            }
-        }
-    }
-    if let Some(s) = word_start {
-        words.push((s, line.len()));
-    }
-    words
-}
-
-/// Which paginated list the arrow keys currently page through. Set when the
-/// user opens one of the lists (Ctrl+H / Ctrl+R / Alt+B); consulted by the
-/// shared Left/Right handler.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NavKind {
-    History,
-    RecentDirs,
-    Bookmarks,
-}
-
-/// Tracks the user's position when paging through one of the lists with
-/// the arrow keys.
-struct NavState {
-    /// `None` until a list is opened; then the kind of list being paged.
-    active: Option<NavKind>,
-    /// 0 = most recent page (newest items, shown at the bottom).
-    page: usize,
-}
-
-impl NavState {
-    fn new() -> Self {
-        Self {
-            active: None,
-            page: 0,
-        }
-    }
-}
-
-/// Total pages needed to show `total` items at `per_page` items per page.
-/// Returns 1 when empty so the renderer can still show a "Page 1/1" frame.
-fn page_count(total: usize, per_page: usize) -> usize {
-    if total == 0 {
-        1
-    } else {
-        total.div_ceil(per_page)
-    }
-}
-
 /// Record `cwd` in the recent-dirs list. If the path is already present we
-/// remove the old entry and push a fresh one to the end, so the list stays
-/// deduped and the newest entry sits at the bottom of the display.
-fn record_recent_dir(recent: &Arc<Mutex<Vec<RecentDir>>>, cwd: &Path) {
-    if let Ok(mut list) = recent.lock() {
-        list.retain(|r| r.path != cwd);
-        list.push(RecentDir {
-            path: cwd.to_path_buf(),
-            dt: Utc::now(),
-        });
-    }
+/// remove the old entry and push a fresh one to the end so the list stays
+/// deduped and the newest entry sits at the top of the display.
+fn record_recent_dir(recent: &mut Vec<RecentDir>, cwd: &Path) {
+    recent.retain(|r| r.path != cwd);
+    recent.push(RecentDir {
+        path: cwd.to_path_buf(),
+        dt: Utc::now(),
+    });
 }
 
-/// Runs one command line. Returns false if the shell should exit.
-fn run_command(state: &mut State, state_path: &Path, input: &str) -> bool {
+/// Runs one command line. Output is pushed into `state.ui.out` rather than
+/// printed to stdout/stderr, so the GUI's terminal pane can show it.
+pub fn run_command(state: &mut State, input: &str) {
     let input = input.trim();
     if input.is_empty() {
-        return true;
+        return;
     }
 
-    // Split into command + remainder for built-in dispatch.
+    // Echo the prompt + command into the output pane so the user can see
+    // what they ran (mirrors how a normal terminal scrolls).
+    let prompt = state.prompt();
+    state.push_out(format!("{prompt}{input}"), OutType::Prompt);
+
     let (cmd, args) = match input.find(char::is_whitespace) {
         Some(i) => (&input[..i], input[i..].trim()),
         None => (input, ""),
     };
 
-    // `his`/`hist <n>` re-runs a previous history item. Handle it before
-    // recording the meta-invocation so the user's history stays focused on
-    // the resolved command (which the recursive call below will record).
+    // `his`/`hist <n>` re-runs a previous history item.
     if cmd == "his" || cmd == "hist" {
         match args.parse::<usize>() {
-            Ok(idx) => {
-                let resolved = state
-                    .history
-                    .and_then(|h| h.get(idx).map(|item| item.text.clone()));
-                match resolved {
-                    Some(text) => {
-                        println!("> {text}");
-                        return run_command(state, state_path, &text);
-                    }
-                    None => eprintln!("{cmd}: no history item at index {idx}"),
+            Ok(idx) => match state.history.get(idx).map(|item| item.text.clone()) {
+                Some(text) => {
+                    run_command(state, &text);
+                    return;
                 }
-            }
-            Err(_) => eprintln!("{cmd}: usage: {cmd} <number>"),
+                None => state.push_out(
+                    format!("{cmd}: no history item at index {idx}"),
+                    OutType::StdErr,
+                ),
+            },
+            Err(_) => state.push_out(format!("{cmd}: usage: {cmd} <number>"), OutType::StdErr),
         }
-        return true;
+        return;
     }
 
-    if let Ok(mut hist) = state.history.lock() {
-        hist.push(HistoryItem {
-            text: input.to_string(),
-            dt: Utc::now(),
-        });
-    }
+    state.history.push(HistoryItem {
+        text: input.to_string(),
+        dt: Utc::now(),
+    });
 
-    // Track directories we've run real commands from (everything except `cd`),
-    // so Ctrl+R / `cd <number>` can jump back to them.
+    // Track directories we've run real commands from (everything except `cd`).
     if cmd != "cd" {
         let cwd = state.cwd.clone();
-        record_recent_dir(&state.recent_dirs, &cwd);
-        if let Err(e) = state.save(state_path) {
-            eprintln!("warning: failed to save recent dirs: {e}");
+        record_recent_dir(&mut state.recent_dirs, &cwd);
+        if let Err(e) = state.save() {
+            state.push_out(
+                format!("warning: failed to save recent dirs: {e}"),
+                OutType::StdErr,
+            );
         }
     }
 
     match cmd {
-        "exit" | "quit" => return false,
+        "exit" | "quit" => {
+            state.push_out("(use the window close button to exit)", OutType::StdErr);
+        }
 
         "sync" => {
             let message = args.trim().trim_matches('"');
-
             if message.is_empty() {
-                eprintln!("sync: commit message required, e.g. sync \"my commit message\"");
+                state.push_out(
+                    "sync: commit message required, e.g. sync \"my commit message\"",
+                    OutType::StdErr,
+                );
             } else {
                 let steps: [&[&str]; 3] = [&["add", "."], &["commit", "-am", message], &["push"]];
-
                 for step in steps {
-                    match Command::new("git").args(step).status() {
-                        Ok(status) if !status.success() => {
-                            eprintln!("sync: `git {}` failed", step.join(" "));
-                            break;
+                    let result = Command::new("git")
+                        .args(step)
+                        .current_dir(&state.cwd)
+                        .output();
+                    match result {
+                        Ok(out) => {
+                            if !out.stdout.is_empty() {
+                                state.push_out(
+                                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                                    OutType::StdOut,
+                                );
+                            }
+                            if !out.stderr.is_empty() {
+                                state.push_out(
+                                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                                    OutType::StdErr,
+                                );
+                            }
+                            if !out.status.success() {
+                                state.push_out(
+                                    format!("sync: `git {}` failed", step.join(" ")),
+                                    OutType::StdErr,
+                                );
+                                break;
+                            }
                         }
                         Err(e) => {
-                            eprintln!("sync: failed to run git: {e}");
+                            state.push_out(
+                                format!("sync: failed to run git: {e}"),
+                                OutType::StdErr,
+                            );
                             break;
                         }
-                        _ => {}
                     }
                 }
             }
         }
 
-        // On linux, this is likely the same as the system `cat` command, but it works on Windows.
-        // Another approach may be to only apply this branch on Windows.
         "cat" => {
-            let target = util::path_from_args(state, args);
-            tasks::cat(&target);
+            let target =
+                path_from_args(state.home.as_deref(), &state.cwd, &state.dir_bookmarks, args);
+            match tasks::read_file(&target) {
+                Ok(text) => state.push_out(text, OutType::StdOut),
+                Err(e) => state.push_out(
+                    format!("cat: {}: {e}", target.display()),
+                    OutType::StdErr,
+                ),
+            }
         }
 
         "del" => {
-            // `del bm <number>`: delete a bookmark by its displayed index
-            // (the numbers shown by the Alt+B bookmark list).
             let (sub, rest) = match args.find(char::is_whitespace) {
                 Some(i) => (&args[..i], args[i..].trim()),
                 None => (args, ""),
             };
-
             match sub {
                 "bm" => match rest.parse::<usize>() {
                     Ok(idx) => {
-                        let mut removed = None;
-                        match state.dir_bookmarks.lock() {
-                            Ok(mut list) => {
-                                if idx < list.len() {
-                                    removed = Some(list.remove(idx));
-                                } else {
-                                    eprintln!(
-                                        "del bm: no bookmark at index {idx} (have {})",
-                                        list.len()
-                                    );
-                                }
+                        if idx < state.dir_bookmarks.len() {
+                            let path = state.dir_bookmarks.remove(idx);
+                            state.push_out(
+                                format!("Deleted bookmark: {}", path.display()),
+                                OutType::StdOut,
+                            );
+                            if let Err(e) = state.save() {
+                                state.push_out(
+                                    format!("del bm: failed to save bookmarks: {e}"),
+                                    OutType::StdErr,
+                                );
                             }
-                            Err(_) => eprintln!("del bm: bookmark list lock poisoned"),
-                        }
-                        if let Some(path) = removed {
-                            println!("Deleted bookmark: {}", path.display());
-                            if let Err(e) = state.save(state_path) {
-                                eprintln!("del bm: failed to save bookmarks: {e}");
-                            }
+                        } else {
+                            let len = state.dir_bookmarks.len();
+                            state.push_out(
+                                format!("del bm: no bookmark at index {idx} (have {len})"),
+                                OutType::StdErr,
+                            );
                         }
                     }
-                    Err(_) => {
-                        eprintln!("del bm: expected a number, e.g. `del bm 4`");
-                    }
+                    Err(_) => state.push_out(
+                        "del bm: expected a number, e.g. `del bm 4`",
+                        OutType::StdErr,
+                    ),
                 },
-                "" => eprintln!("del: usage: del bm <number>"),
-                other => eprintln!("del: unknown target `{other}` (expected `bm`)"),
+                "" => state.push_out("del: usage: del bm <number>", OutType::StdErr),
+                other => state.push_out(
+                    format!("del: unknown target `{other}` (expected `bm`)"),
+                    OutType::StdErr,
+                ),
             }
         }
 
         "cd" => {
-            // `cd <number>` (with nothing else after) jumps to a recent
-            // directory by its Ctrl+R index. Anything else is resolved as a
-            // normal path/bookmark argument.
             let target = if let Ok(idx) = args.parse::<usize>() {
-                let resolved = state
-                    .recent_dirs
-                    .lock()
-                    .ok()
-                    .and_then(|list| list.get(idx).map(|r| r.path.clone()));
-                match resolved {
+                match state.recent_dirs.get(idx).map(|r| r.path.clone()) {
                     Some(p) => Some(p),
                     None => {
-                        eprintln!("cd: no recent directory at index {idx}");
+                        state.push_out(
+                            format!("cd: no recent directory at index {idx}"),
+                            OutType::StdErr,
+                        );
                         None
                     }
                 }
             } else {
-                Some(util::path_from_args(state, args))
+                Some(path_from_args(
+                    state.home.as_deref(),
+                    &state.cwd,
+                    &state.dir_bookmarks,
+                    args,
+                ))
             };
 
             if let Some(target) = target {
-                match env::set_current_dir(&target) {
-                    Ok(_) => state.cwd = env::current_dir().unwrap_or(target),
-                    Err(e) => eprintln!("cd: {e}"),
-                }
+                state.change_dir(target);
             }
         }
 
-        // `bm <number>`: jump to the bookmark at that Alt+B index. Mirrors
-        // `cd <number>` but indexes into the bookmark list instead of
-        // recent_dirs.
         "bm" => match args.parse::<usize>() {
-            Ok(idx) => {
-                let resolved = state
-                    .dir_bookmarks
-                    .lock()
-                    .ok()
-                    .and_then(|list| list.get(idx).cloned());
-                match resolved {
-                    Some(target) => match env::set_current_dir(&target) {
-                        Ok(_) => state.cwd = env::current_dir().unwrap_or(target),
-                        Err(e) => eprintln!("bm: {e}"),
-                    },
-                    None => eprintln!("bm: no bookmark at index {idx}"),
-                }
-            }
-            Err(_) => eprintln!("bm: usage: bm <number>"),
+            Ok(idx) => match state.dir_bookmarks.get(idx).cloned() {
+                Some(target) => state.change_dir(target),
+                None => state.push_out(format!("bm: no bookmark at index {idx}"), OutType::StdErr),
+            },
+            Err(_) => state.push_out("bm: usage: bm <number>", OutType::StdErr),
         },
 
-        // Everything else: Pass through to the system shell (e.g. the one which we launched this
-        // application from)
         _ => {
             let result = if cfg!(windows) {
-                // Powershell 7+; we will assume Windows users have this.
-                // -NoProfile/-NoLogo skip loading the user's $PROFILE and the
-                // startup banner, which together dominate pwsh's cold-start
-                // time. Each command spawns a fresh process, so this shaves
-                // ~200ms off every passthrough command.
                 Command::new("pwsh")
                     .args(["-NoProfile", "-NoLogo", "-Command", input])
-                    .status()
+                    .current_dir(&state.cwd)
+                    .output()
             } else {
-                Command::new("sh").args(["-c", input]).status()
+                Command::new("sh")
+                    .args(["-c", input])
+                    .current_dir(&state.cwd)
+                    .output()
             };
-            if let Err(e) = result {
-                eprintln!("shell: {e}");
+            match result {
+                Ok(out) => {
+                    if !out.stdout.is_empty() {
+                        state.push_out(
+                            String::from_utf8_lossy(&out.stdout).into_owned(),
+                            OutType::StdOut,
+                        );
+                    }
+                    if !out.stderr.is_empty() {
+                        state.push_out(
+                            String::from_utf8_lossy(&out.stderr).into_owned(),
+                            OutType::StdErr,
+                        );
+                    }
+                }
+                Err(e) => state.push_out(format!("shell: {e}"), OutType::StdErr),
             }
         }
     }
-
-    true
 }
 
 fn main() {
@@ -439,7 +409,9 @@ fn main() {
         ..Default::default()
     };
 
-    let mut state = State::default();
+    let state_path =
+        save_data::default_path().unwrap_or_else(|| PathBuf::from(save_data::FILENAME));
+    let state = State::load(state_path).unwrap_or_default();
 
     eframe::run_native("Shell", options, Box::new(|_cc| Ok(Box::new(state)))).unwrap();
 }

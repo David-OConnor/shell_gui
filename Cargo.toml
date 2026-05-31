@@ -1,5 +1,5 @@
 [package]
-name = "shell"
+name = "shell_gui"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,3 +9,5 @@ chrono = "0.4.44"
 egui = "0.34.1"
 eframe = "0.34.1"
 #egui-file-dialog = "0.13.0" #  For file dialogs.
+
+shell = {path = "../shell"}
