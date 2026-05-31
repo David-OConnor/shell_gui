@@ -17,8 +17,6 @@ use crate::gui::{WINDOW_HEIGHT, WINDOW_WIDTH};
 // Display this many history items at a time.
 const DISP_HIST_LEN: usize = 20;
 
-const DIVIDER: &str = "----------";
-
 struct HistoryItem {
     pub text: String,
     pub dt: DateTime<Utc>,
@@ -219,92 +217,6 @@ fn page_count(total: usize, per_page: usize) -> usize {
     } else {
         total.div_ceil(per_page)
     }
-}
-
-/// Render one page of a list: header with paging hint + usage hint, a
-/// page of rows, and a closing divider. Page 0 = the last `per_page`
-/// items (newest at the bottom). Rows are labelled with their absolute
-/// index into `items`, so the displayed number lines up with the
-/// corresponding `<cmd> <number>` invocation.
-fn render_page<T>(
-    title: &str,
-    usage_hint: &str,
-    empty_msg: &str,
-    items: &[T],
-    page: usize,
-    per_page: usize,
-    mut format_row: impl FnMut(usize, &T) -> String,
-) -> String {
-    let total = items.len();
-    let pages = page_count(total, per_page);
-    let page = page.min(pages - 1);
-
-    let mut msg = format!(
-        "\n{title}  (← older page  → newer page).  {usage_hint}.  Page {}/{}:\n",
-        page + 1,
-        pages
-    );
-    msg.push_str(DIVIDER);
-    msg.push('\n');
-
-    if total == 0 {
-        msg.push_str(empty_msg);
-        msg.push('\n');
-    } else {
-        let end = total - page * per_page;
-        let start = end.saturating_sub(per_page);
-        for i in start..end {
-            msg.push_str(&format_row(i, &items[i]));
-            msg.push('\n');
-        }
-    }
-    msg.push_str(DIVIDER);
-    msg.push_str("\n\n");
-    msg
-}
-
-fn render_history(history: &[HistoryItem], page: usize) -> String {
-    render_page(
-        "History",
-        "Use `his <number>` to run; e.g. `his 4`",
-        "(no history)",
-        history,
-        page,
-        DISP_HIST_LEN,
-        |i, item| format!("{i}:  {}", item.text),
-    )
-}
-
-fn render_recent_dirs(
-    recent: &[RecentDir],
-    bookmarks: &[PathBuf],
-    home: Option<&Path>,
-    page: usize,
-) -> String {
-    render_page(
-        "Recent directories",
-        "Use `cd <number>` to go; e.g. `cd 4`",
-        "(no recent directories)",
-        recent,
-        page,
-        DISP_HIST_LEN,
-        |i, r| {
-            let star = if bookmarks.contains(&r.path) { "*" } else { "" };
-            format!("{i}:  {star}{}", render_with_tilde(&r.path, home))
-        },
-    )
-}
-
-fn render_bookmarks(bookmarks: &[PathBuf], home: Option<&Path>, page: usize) -> String {
-    render_page(
-        "Bookmarks",
-        "Use `del bm <number>` to delete; e.g. `del bm 4`",
-        "(no bookmarks)",
-        bookmarks,
-        page,
-        DISP_HIST_LEN,
-        |i, bm| format!("{i}:  {}", render_with_tilde(bm, home)),
-    )
 }
 
 /// Record `cwd` in the recent-dirs list. If the path is already present we
