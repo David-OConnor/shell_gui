@@ -15,7 +15,7 @@ fn search_box(ui: &mut Ui, buf: &mut String, id_salt: &str) -> bool {
     .changed()
 }
 
-use crate::{OutType, State, ansi, render_with_tilde, run_command};
+use crate::{OutType, ansi, render_with_tilde, run_command, state::State};
 
 pub const WINDOW_WIDTH: f32 = 1400.;
 pub const WINDOW_HEIGHT: f32 = 900.;
@@ -23,12 +23,18 @@ pub const WINDOW_HEIGHT: f32 = 900.;
 const SIDE_COL_WIDTH: f32 = 240.;
 const RIGHT_COL_WIDTH: f32 = 280.;
 const CWD_HIST_COL_WIDTH: f32 = 240.;
+const BROWSER_COL_WIDTH: f32 = 220.;
+const REMOTE_COL_WIDTH: f32 = 200.;
 
 const COLOR_PROMPT: Color32 = Color32::from_rgb(220, 220, 90);
 const COLOR_STDOUT: Color32 = Color32::from_rgb(210, 210, 210);
 const COLOR_STDERR: Color32 = Color32::from_rgb(240, 110, 110);
 // Light green to match the CLI's `his N` highlight.
 const COLOR_HIS: Color32 = Color32::from_rgb(120, 240, 120);
+// Magenta to match the CLI's branch-indicator highlight (`\x1b[95m`).
+const COLOR_BRANCH: Color32 = Color32::from_rgb(255, 130, 255);
+// Executable-file colour in the file-browser column.
+const COLOR_EXECUTABLE: Color32 = Color32::from_rgb(120, 220, 120);
 
 /// Action a list-panel button asked us to take. Collected during rendering
 /// (where we only hold `&State`'s fields immutably via iteration) and
@@ -127,11 +133,7 @@ fn dir_history(state: &mut State, ui: &mut Ui) {
 fn cwd_cmd_history(state: &mut State, ui: &mut Ui) {
     ui.heading("In this dir");
 
-    if search_box(
-        ui,
-        &mut state.ui.cwd_history_search,
-        "cwd_history_search",
-    ) {
+    if search_box(ui, &mut state.ui.cwd_history_search, "cwd_history_search") {
         state.refresh_cwd_history_filter();
     }
     ui.separator();
@@ -270,9 +272,17 @@ fn term_out(state: &mut State, ui: &mut Ui) {
 fn term_in(state: &mut State, ui: &mut Ui) {
     let active = state.ui.active_tab;
     let (his_cursor, cd_cursor) = state.active_nav_cursors();
-    let cwd_part = state.prompt(&shell::NavState::new());
+    let cwd_part = state.cwd_display();
+    let branch = state.branch[active].clone();
     ui.horizontal(|ui| {
         ui.label(RichText::new(cwd_part).color(COLOR_PROMPT).monospace());
+        if let Some(b) = branch {
+            ui.label(
+                RichText::new(format!("branch: {}", shell::truncate_branch(&b, 10)))
+                    .color(COLOR_BRANCH)
+                    .monospace(),
+            );
+        }
         if let Some(i) = his_cursor {
             ui.label(
                 RichText::new(format!("his {i}"))
@@ -315,10 +325,10 @@ fn term_in(state: &mut State, ui: &mut Ui) {
             } else {
                 let cd_active = cd_cursor.is_some() || state.ui.cli_input[active].is_empty();
                 if cd_active {
-                    let left = ui
-                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft));
-                    let right = ui
-                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowRight));
+                    let left =
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft));
+                    let right =
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowRight));
                     if left {
                         state.recent_dir_nav(true);
                     } else if right {
@@ -334,6 +344,72 @@ fn term_in(state: &mut State, ui: &mut Ui) {
             run_command(state, &input);
             state.ui.focus_input = true;
         }
+    });
+}
+
+/// Files in the active tab's cwd, as a simple text column. Folders are
+/// sorted first and prefixed with 📁; executable files (Unix +x, or
+/// Windows `.exe`/`.msi`) are coloured green. The listing is refreshed
+/// by [State::refresh_browser_files] on every cwd change and after every
+/// command, so we just read what's already there.
+fn file_browser(state: &mut State, ui: &mut Ui) {
+    ui.heading("Files");
+    ui.separator();
+
+    ScrollArea::vertical()
+        .id_salt("file_browser_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for f in &state.browser_files {
+                let text = if f.is_folder {
+                    format!("📁 {}", f.disp_name)
+                } else {
+                    f.disp_name.clone()
+                };
+                let mut rich = RichText::new(text).monospace();
+                if !f.is_folder && f.is_executable {
+                    rich = rich.color(COLOR_EXECUTABLE);
+                }
+                ui.label(rich);
+            }
+        });
+}
+
+/// Saved remote-terminal entries. Minimal for now — one row per host,
+/// `username@host:port`. No actions wired up yet; the panel exists so
+/// the visibility toggle has something to show, and so the data round-
+/// trips through the save file.
+fn remote_terminals(state: &mut State, ui: &mut Ui) {
+    ui.heading("Remote");
+    ui.separator();
+
+    ScrollArea::vertical()
+        .id_salt("remote_terminals_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if state.remote_terminals.is_empty() {
+                ui.label(RichText::new("(none)").italics());
+                return;
+            }
+            for rt in &state.remote_terminals {
+                ui.label(format!("{}@{}:{}", rt.username, rt.host, rt.port));
+            }
+        });
+}
+
+/// Row of show/hide toggles for the optional side panels. Lives in the
+/// top tabs panel (rendered next to the tab strip) so that even when
+/// every side panel is hidden, the user still has a way to bring one
+/// back. Each toggle reads from / writes back to [PanelVis] on the
+/// active StateUi.
+fn panel_toggles(state: &mut State, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.label("Panels:");
+        let v = &mut state.ui.panel_vis;
+        ui.toggle_value(&mut v.bookmarks, "Bookmarks");
+        ui.toggle_value(&mut v.recent_dirs, "Recent");
+        ui.toggle_value(&mut v.file_browser, "Files");
+        ui.toggle_value(&mut v.remote_terminals, "Remote");
     });
 }
 
@@ -392,21 +468,44 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
         .resizable(false)
         .show_inside(ui, |ui| {
             tabs_bar(state, ui);
+            panel_toggles(state, ui);
         });
 
-    Panel::left("bookmarks_panel")
-        .resizable(true)
-        .default_size(SIDE_COL_WIDTH)
-        .show_inside(ui, |ui| {
-            dir_bookmarks(state, ui);
-        });
+    if state.ui.panel_vis.bookmarks {
+        Panel::left("bookmarks_panel")
+            .resizable(true)
+            .default_size(SIDE_COL_WIDTH)
+            .show_inside(ui, |ui| {
+                dir_bookmarks(state, ui);
+            });
+    }
 
-    Panel::left("recent_dirs_panel")
-        .resizable(true)
-        .default_size(SIDE_COL_WIDTH)
-        .show_inside(ui, |ui| {
-            dir_history(state, ui);
-        });
+    if state.ui.panel_vis.recent_dirs {
+        Panel::left("recent_dirs_panel")
+            .resizable(true)
+            .default_size(SIDE_COL_WIDTH)
+            .show_inside(ui, |ui| {
+                dir_history(state, ui);
+            });
+    }
+
+    if state.ui.panel_vis.file_browser {
+        Panel::left("file_browser_panel")
+            .resizable(true)
+            .default_size(BROWSER_COL_WIDTH)
+            .show_inside(ui, |ui| {
+                file_browser(state, ui);
+            });
+    }
+
+    if state.ui.panel_vis.remote_terminals {
+        Panel::left("remote_terminals_panel")
+            .resizable(true)
+            .default_size(REMOTE_COL_WIDTH)
+            .show_inside(ui, |ui| {
+                remote_terminals(state, ui);
+            });
+    }
 
     Panel::right("cmd_history_panel")
         .resizable(true)
