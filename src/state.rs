@@ -5,30 +5,11 @@ use std::{
 
 use chrono::Utc;
 use shell::{
-    BrowserFile, HistoryItem, NavState, RecentDir, RemoteTerminal, current_branch, get_home,
-    read_browser_files, save_data, truncate_branch,
+    BrowserFile, HistoryItem, NavState, PanelVis, RecentDir, RemoteTerminal, current_branch,
+    get_home, read_browser_files, save_data, truncate_branch,
 };
 
 use crate::{OutItem, OutType, gui};
-
-/// True for visible; False for hidden.
-pub struct PanelVis {
-    pub bookmarks: bool,
-    pub recent_dirs: bool,
-    pub remote_terminals: bool,
-    pub file_browser: bool,
-}
-
-impl Default for PanelVis {
-    fn default() -> Self {
-        Self {
-            bookmarks: true,
-            recent_dirs: true,
-            remote_terminals: false,
-            file_browser: true,
-        }
-    }
-}
 
 /// State specific to the GUI: the current input buffer, the captured terminal
 /// output, and a "please focus the input next frame" flag we use after
@@ -201,6 +182,7 @@ impl State {
             &self.recent_dirs,
             &self.history,
             &self.remote_terminals,
+            &self.ui.panel_vis,
             &self.state_path,
         )
     }
@@ -210,8 +192,10 @@ impl State {
         let cwd = env::current_dir().unwrap_or_default();
         let branch = current_branch(&cwd);
 
+        let mut ui = StateUi::default();
+        ui.panel_vis = loaded.panel_vis;
         let mut s = Self {
-            ui: StateUi::default(),
+            ui,
             home: get_home(),
             history: loaded.history,
             cwd: vec![cwd],

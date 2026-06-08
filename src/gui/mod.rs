@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use egui::{CentralPanel, Color32, Frame, Key, Panel, RichText, ScrollArea, TextEdit, Ui};
+use egui::{
+    CentralPanel, Color32, Frame, Key, Label, Panel, RichText, ScrollArea, Sense, TextEdit,
+    TextWrapMode, Ui,
+};
 
 /// Renders a single-line "Search..." box that fills the available width and
 /// triggers `on_changed` when the buffer is edited. Pulled out so all three
@@ -21,7 +24,7 @@ pub const WINDOW_WIDTH: f32 = 1400.;
 pub const WINDOW_HEIGHT: f32 = 900.;
 
 const SIDE_COL_WIDTH: f32 = 240.;
-const RIGHT_COL_WIDTH: f32 = 280.;
+const RIGHT_COL_WIDTH: f32 = 200.;
 const CWD_HIST_COL_WIDTH: f32 = 240.;
 const BROWSER_COL_WIDTH: f32 = 220.;
 const REMOTE_COL_WIDTH: f32 = 200.;
@@ -177,33 +180,40 @@ fn cmd_history(state: &mut State, ui: &mut Ui) {
         .id_salt("cmd_history_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // Force every widget in this column to wrap rather than
+            // expand horizontally — the panel itself is capped at 200px
+            // wide, so long command lines need to break onto extra rows.
+            ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
+
             // Newest first.
             for &i in state.ui.history_filter.iter().rev() {
                 let Some(item) = state.history.get(i) else {
                     continue;
                 };
-                ui.horizontal(|ui| {
-                    let label = format!("{i}: {}", item.text);
-                    if ui.button(label).clicked() {
-                        action = Some(ListAction::FillInput(item.text.clone()));
-                    }
-                    // Last path component, capped at 20 chars so long folder
-                    // names don't blow out the row width.
-                    let leaf = item
-                        .dir
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| item.dir.display().to_string());
-                    let leaf = if leaf.chars().count() > 20 {
-                        let truncated: String = leaf.chars().take(20).collect();
-                        truncated
-                    } else {
-                        leaf
-                    };
-                    if ui.small_button(format!("In {leaf}")).clicked() {
-                        action = Some(ListAction::RunHistoryInDir(i));
-                    }
-                });
+                let label = format!("{i}: {}", item.text);
+                let btn = egui::Button::new(label)
+                    .wrap()
+                    .min_size(egui::vec2(ui.available_width(), 0.0));
+                if ui.add(btn).clicked() {
+                    action = Some(ListAction::FillInput(item.text.clone()));
+                }
+                // "In <leaf>" sits on its own row underneath so it
+                // doesn't fight the wrapping command-text button for
+                // horizontal space.
+                let leaf = item
+                    .dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| item.dir.display().to_string());
+                let leaf = if leaf.chars().count() > 20 {
+                    leaf.chars().take(20).collect::<String>()
+                } else {
+                    leaf
+                };
+                if ui.small_button(format!("In {leaf}")).clicked() {
+                    action = Some(ListAction::RunHistoryInDir(i));
+                }
+                ui.separator();
             }
         });
 
@@ -352,9 +362,14 @@ fn term_in(state: &mut State, ui: &mut Ui) {
 /// Windows `.exe`/`.msi`) are coloured green. The listing is refreshed
 /// by [State::refresh_browser_files] on every cwd change and after every
 /// command, so we just read what's already there.
+///
+/// Double-clicking a folder row navigates into it (same path as
+/// clicking a bookmark or recent dir).
 fn file_browser(state: &mut State, ui: &mut Ui) {
     ui.heading("Files");
     ui.separator();
+
+    let mut action: Option<ListAction> = None;
 
     ScrollArea::vertical()
         .id_salt("file_browser_scroll")
@@ -370,9 +385,21 @@ fn file_browser(state: &mut State, ui: &mut Ui) {
                 if !f.is_folder && f.is_executable {
                     rich = rich.color(COLOR_EXECUTABLE);
                 }
-                ui.label(rich);
+                // Folders get a click sense so we can detect the
+                // double-click; files stay as plain labels (no action
+                // wired up for them yet).
+                if f.is_folder {
+                    let resp = ui.add(Label::new(rich).sense(Sense::click()));
+                    if resp.double_clicked() {
+                        action = Some(ListAction::ChangeDir(f.path.clone()));
+                    }
+                } else {
+                    ui.label(rich);
+                }
             }
         });
+
+    apply_action(state, action);
 }
 
 /// Saved remote-terminal entries. Minimal for now — one row per host,
@@ -403,14 +430,34 @@ fn remote_terminals(state: &mut State, ui: &mut Ui) {
 /// back. Each toggle reads from / writes back to [PanelVis] on the
 /// active StateUi.
 fn panel_toggles(state: &mut State, ui: &mut Ui) {
+    let before = state.ui.panel_vis;
     ui.horizontal(|ui| {
         ui.label("Panels:");
         let v = &mut state.ui.panel_vis;
         ui.toggle_value(&mut v.bookmarks, "Bookmarks");
-        ui.toggle_value(&mut v.recent_dirs, "Recent");
+        ui.toggle_value(&mut v.recent_dirs, "Recent dirs");
         ui.toggle_value(&mut v.file_browser, "Files");
         ui.toggle_value(&mut v.remote_terminals, "Remote");
+        ui.toggle_value(&mut v.recent_cmds, "Cmd history");
+        ui.toggle_value(&mut v.recent_cmds_in_dir, "In this dir");
     });
+
+    // Persist on any change so the layout survives restart.
+    let after = state.ui.panel_vis;
+    if !panel_vis_eq(&before, &after) {
+        let _ = state.save();
+    }
+}
+
+/// Field-by-field equality so a toggle change triggers a save without
+/// adding PartialEq derives on the upstream struct.
+fn panel_vis_eq(a: &shell::PanelVis, b: &shell::PanelVis) -> bool {
+    a.bookmarks == b.bookmarks
+        && a.recent_dirs == b.recent_dirs
+        && a.recent_cmds == b.recent_cmds
+        && a.recent_cmds_in_dir == b.recent_cmds_in_dir
+        && a.remote_terminals == b.remote_terminals
+        && a.file_browser == b.file_browser
 }
 
 /// Top-of-window tab strip. Each tab labels itself with its cwd's leaf
@@ -507,19 +554,27 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             });
     }
 
-    Panel::right("cmd_history_panel")
-        .resizable(true)
-        .default_size(RIGHT_COL_WIDTH)
-        .show_inside(ui, |ui| {
-            cmd_history(state, ui);
-        });
+    if state.ui.panel_vis.recent_cmds {
+        // Cap the cmd-history panel at 200px wide so long commands don't
+        // blow out its column; rows wrap inside it instead. `max_size`
+        // still allows shrinking via the drag handle.
+        Panel::right("cmd_history_panel")
+            .resizable(true)
+            .default_size(RIGHT_COL_WIDTH)
+            .max_size(RIGHT_COL_WIDTH)
+            .show_inside(ui, |ui| {
+                cmd_history(state, ui);
+            });
+    }
 
-    Panel::right("cwd_cmd_history_panel")
-        .resizable(true)
-        .default_size(CWD_HIST_COL_WIDTH)
-        .show_inside(ui, |ui| {
-            cwd_cmd_history(state, ui);
-        });
+    if state.ui.panel_vis.recent_cmds_in_dir {
+        Panel::right("cwd_cmd_history_panel")
+            .resizable(true)
+            .default_size(CWD_HIST_COL_WIDTH)
+            .show_inside(ui, |ui| {
+                cwd_cmd_history(state, ui);
+            });
+    }
 
     // Black backgrounds on the terminal panes so they read as a terminal,
     // not as a regular widget area.
