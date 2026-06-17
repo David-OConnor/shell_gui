@@ -5,8 +5,8 @@ use std::{
 
 use chrono::Utc;
 use shell::{
-    BrowserFile, HistoryItem, NavState, PanelVis, RecentDir, RemoteTerminal, current_branch,
-    get_home, read_browser_files, save_data, truncate_branch,
+    BrowserFile, HistoryItem, NavState, PanelVis, RecentDir, RemoteTerminal, apply_completion,
+    complete_cd_path, current_branch, get_home, read_browser_files, save_data, truncate_branch,
 };
 
 use crate::{OutItem, OutType, gui};
@@ -406,6 +406,24 @@ impl State {
         });
 
         if let Some(text) = result {
+            self.ui.cli_input[i] = text;
+        }
+    }
+
+    /// Complete the active input row using the shared `cd` path completer.
+    pub fn autocomplete_input(&mut self) {
+        let i = self.ui.active_tab;
+        let live = self.ui.cli_input[i].clone();
+        let Some(result) = complete_cd_path(
+            &live,
+            live.len(),
+            self.cwd(),
+            self.home.as_deref(),
+            &self.dir_bookmarks,
+        ) else {
+            return;
+        };
+        if let Some(text) = apply_completion(&live, live.len(), &result) {
             self.ui.cli_input[i] = text;
         }
     }

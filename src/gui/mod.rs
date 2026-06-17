@@ -325,10 +325,15 @@ fn term_in(state: &mut State, ui: &mut Ui) {
         // single-line TextEdit doesn't use them), but Left/Right only
         // steal the keystroke when the buffer is empty or a cd recall is
         // already active — otherwise they stay as normal caret movement.
-        if response.has_focus() {
-            let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
-            let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
-            if up {
+        if response.has_focus() || response.lost_focus() {
+            let tab = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
+            let up = !tab && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
+            let down =
+                !tab && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
+            if tab {
+                state.autocomplete_input();
+                response.request_focus();
+            } else if up {
                 state.history_nav(true);
             } else if down {
                 state.history_nav(false);
