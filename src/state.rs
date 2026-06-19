@@ -51,6 +51,14 @@ pub struct StateUi {
     /// walks `recent_dirs`. See [NavState].
     pub history_nav: Vec<NavState>,
     pub panel_vis: PanelVis,
+
+    /// Per-tab browser-style back/forward navigation stacks (parallel to
+    /// `State::cwd`). `nav_back` holds dirs we can return to (most recent on
+    /// top); `nav_forward` holds dirs we can re-visit after going Back.
+    /// Populated whenever the cwd changes via [State::change_dir]; not
+    /// persisted (a fresh session starts with empty stacks).
+    pub nav_back: Vec<Vec<PathBuf>>,
+    pub nav_forward: Vec<Vec<PathBuf>>,
 }
 
 impl Default for StateUi {
@@ -70,6 +78,8 @@ impl Default for StateUi {
             cwd_history_filter: Vec::new(),
             history_nav: vec![NavState::new()],
             panel_vis: PanelVis::default(),
+            nav_back: vec![Vec::new()],
+            nav_forward: vec![Vec::new()],
         }
     }
 }
@@ -233,6 +243,8 @@ impl State {
         ui.cli_input = vec![String::new(); n];
         ui.out = (0..n).map(|_| Vec::new()).collect();
         ui.history_nav = (0..n).map(|_| NavState::new()).collect();
+        ui.nav_back = (0..n).map(|_| Vec::new()).collect();
+        ui.nav_forward = (0..n).map(|_| Vec::new()).collect();
 
         let mut s = Self {
             ui,
@@ -276,6 +288,8 @@ impl State {
         self.ui.cli_input.push(String::new());
         self.ui.out.push(Vec::new());
         self.ui.history_nav.push(NavState::new());
+        self.ui.nav_back.push(Vec::new());
+        self.ui.nav_forward.push(Vec::new());
         self.branch.push(inherited_branch);
 
         self.ui.active_tab = self.cwd.len() - 1;
@@ -295,6 +309,8 @@ impl State {
         self.ui.cli_input.remove(idx);
         self.ui.out.remove(idx);
         self.ui.history_nav.remove(idx);
+        self.ui.nav_back.remove(idx);
+        self.ui.nav_forward.remove(idx);
         self.branch.remove(idx);
 
         if self.ui.active_tab >= self.cwd.len() {
@@ -476,9 +492,11 @@ impl State {
         self.ui.history_nav[i].reset();
     }
 
-    /// `cd` to `target` and update the active tab's cwd. Pushes a diagnostic
-    /// on failure.
-    pub fn change_dir(&mut self, target: PathBuf) {
+    /// Raw cwd change for the active tab, without touching the back/forward
+    /// stacks. Returns `true` if the cwd actually changed. Pushes a
+    /// diagnostic on failure.
+    fn navigate_to(&mut self, target: PathBuf) -> bool {
+        let before = self.cwd().to_path_buf();
         match env::set_current_dir(&target) {
             Ok(_) => {
                 let new_cwd = env::current_dir().unwrap_or(target);
@@ -487,8 +505,59 @@ impl State {
                 self.refresh_cwd_history_filter();
                 self.refresh_branch();
                 self.refresh_browser_files();
+                self.cwd() != before
             }
-            Err(e) => self.push_out(format!("cd: {e}"), OutType::StdErr),
+            Err(e) => {
+                self.push_out(format!("cd: {e}"), OutType::StdErr);
+                false
+            }
+        }
+    }
+
+    /// `cd` to `target` and update the active tab's cwd. This is the "normal"
+    /// navigation path (typed `cd`, clicking a bookmark/recent dir/folder,
+    /// the Up button): on success it records the previous dir on the Back
+    /// stack and clears the Forward stack, just like a web/file browser.
+    pub fn change_dir(&mut self, target: PathBuf) {
+        let before = self.cwd().to_path_buf();
+        if self.navigate_to(target) {
+            let i = self.ui.active_tab;
+            self.ui.nav_back[i].push(before);
+            self.ui.nav_forward[i].clear();
+        }
+    }
+
+    /// Navigate to the parent of the active tab's cwd. No-op at a filesystem
+    /// root. Records history like any other navigation.
+    pub fn nav_up(&mut self) {
+        if let Some(parent) = self.cwd().parent() {
+            let parent = parent.to_path_buf();
+            self.change_dir(parent);
+        }
+    }
+
+    /// Back button: return to the most recent dir on the Back stack, pushing
+    /// the current dir onto the Forward stack so it can be re-visited.
+    pub fn nav_back(&mut self) {
+        let i = self.ui.active_tab;
+        let Some(target) = self.ui.nav_back[i].pop() else {
+            return;
+        };
+        let before = self.cwd().to_path_buf();
+        if self.navigate_to(target) {
+            self.ui.nav_forward[i].push(before);
+        }
+    }
+
+    /// Forward button: re-visit the dir we last went Back from.
+    pub fn nav_forward(&mut self) {
+        let i = self.ui.active_tab;
+        let Some(target) = self.ui.nav_forward[i].pop() else {
+            return;
+        };
+        let before = self.cwd().to_path_buf();
+        if self.navigate_to(target) {
+            self.ui.nav_back[i].push(before);
         }
     }
 }

@@ -23,7 +23,13 @@ use crate::{OutType, ansi, render_with_tilde, run_command, state::State};
 pub const WINDOW_WIDTH: f32 = 1400.;
 pub const WINDOW_HEIGHT: f32 = 900.;
 
-const SIDE_COL_WIDTH: f32 = 240.;
+/// Bookmarks column. Narrower than the other side columns: bookmark paths are
+/// truncated to [BOOKMARK_MAX_LEN] chars, so this only needs to fit the
+/// `"<i>: "` prefix plus that path and the trailing `x` button.
+const BOOKMARK_COL_WIDTH: f32 = 190.;
+/// Recent-dirs column. Paths are truncated to [BOOKMARK_MAX_LEN] chars like
+/// bookmarks; slightly wider to fit the extra `*` (bookmarked) marker.
+const RECENT_DIRS_COL_WIDTH: f32 = 195.;
 const RIGHT_COL_WIDTH: f32 = 200.;
 const CWD_HIST_COL_WIDTH: f32 = 240.;
 const BROWSER_COL_WIDTH: f32 = 220.;
@@ -49,6 +55,25 @@ enum ListAction {
     /// Re-run the history item at this index in its original working dir,
     /// without changing the GUI's CWD. Delegates to the `hisd` built-in.
     RunHistoryInDir(usize),
+}
+
+/// Max displayed length (in characters) of a bookmark's path. Longer paths
+/// are truncated from the front by [truncate_start] so the column stays narrow.
+const BOOKMARK_MAX_LEN: usize = 22;
+
+/// Truncate `s` to at most `max` characters for display in a narrow column,
+/// keeping the tail (the most specific part of a path) and prefixing `...`
+/// when shortened, e.g. `.../code/Bio/dynamics`. Counts by `char` so the
+/// result is never longer than `max` even with multi-byte characters.
+fn truncate_start(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    // Reserve 3 chars for the leading ellipsis.
+    let keep = max.saturating_sub(3);
+    let tail: String = s.chars().skip(count - keep).collect();
+    format!("...{tail}")
 }
 
 /// Display directory bookmarks as a clickable column. Clicking a row cd's
@@ -79,7 +104,8 @@ fn dir_bookmarks(state: &mut State, ui: &mut Ui) {
                     continue;
                 };
                 ui.horizontal(|ui| {
-                    let label = format!("{i}: {}", render_with_tilde(bm, home.as_deref()));
+                    let path = render_with_tilde(bm, home.as_deref());
+                    let label = format!("{i}: {}", truncate_start(&path, BOOKMARK_MAX_LEN));
                     if ui.button(label).clicked() {
                         action = Some(ListAction::ChangeDir(bm.clone()));
                     }
@@ -121,7 +147,8 @@ fn dir_history(state: &mut State, ui: &mut Ui) {
                 } else {
                     ""
                 };
-                let label = format!("{i}: {star}{}", render_with_tilde(&r.path, home.as_deref()));
+                let path = render_with_tilde(&r.path, home.as_deref());
+                let label = format!("{i}: {star}{}", truncate_start(&path, BOOKMARK_MAX_LEN));
                 if ui.button(label).clicked() {
                     action = Some(ListAction::ChangeDir(r.path.clone()));
                 }
@@ -398,6 +425,48 @@ fn term_in(state: &mut State, ui: &mut Ui) {
 /// clicking a bookmark or recent dir).
 fn file_browser(state: &mut State, ui: &mut Ui) {
     ui.heading("Files");
+
+    // Browser-style navigation row. Up goes to the parent dir; Back/Forward
+    // walk the per-tab history maintained in `State::change_dir`. Buttons are
+    // disabled when there's nowhere to go in that direction.
+    let i = state.ui.active_tab;
+    let can_up = state.cwd().parent().is_some();
+    let can_back = !state.ui.nav_back[i].is_empty();
+    let can_forward = !state.ui.nav_forward[i].is_empty();
+    let mut go_up = false;
+    let mut go_back = false;
+    let mut go_forward = false;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(can_up, egui::Button::new("Up"))
+            .on_hover_text("Parent directory")
+            .clicked()
+        {
+            go_up = true;
+        }
+        if ui
+            .add_enabled(can_back, egui::Button::new("Back"))
+            .on_hover_text("Previous directory")
+            .clicked()
+        {
+            go_back = true;
+        }
+        if ui
+            .add_enabled(can_forward, egui::Button::new("Forward"))
+            .on_hover_text("Next directory")
+            .clicked()
+        {
+            go_forward = true;
+        }
+    });
+    if go_up {
+        state.nav_up();
+    } else if go_back {
+        state.nav_back();
+    } else if go_forward {
+        state.nav_forward();
+    }
+
     ui.separator();
 
     let mut action: Option<ListAction> = None;
@@ -552,7 +621,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
     if state.ui.panel_vis.bookmarks {
         Panel::left("bookmarks_panel")
             .resizable(true)
-            .default_size(SIDE_COL_WIDTH)
+            .default_size(BOOKMARK_COL_WIDTH)
             .show_inside(ui, |ui| {
                 dir_bookmarks(state, ui);
             });
@@ -561,7 +630,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
     if state.ui.panel_vis.recent_dirs {
         Panel::left("recent_dirs_panel")
             .resizable(true)
-            .default_size(SIDE_COL_WIDTH)
+            .default_size(RECENT_DIRS_COL_WIDTH)
             .show_inside(ui, |ui| {
                 dir_history(state, ui);
             });
