@@ -320,6 +320,22 @@ fn term_in(state: &mut State, ui: &mut Ui) {
             state.ui.focus_input = false;
         }
 
+        // Stop egui from stealing Tab for widget-to-widget focus navigation:
+        // we use Tab ourselves for path autocompletion below. Locking the
+        // filter tells egui this widget consumes Tab, so focus stays in the
+        // input instead of jumping to the next button.
+        if response.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        ..Default::default()
+                    },
+                );
+            });
+        }
+
         // Arrow-key recall: ↑/↓ walks the global history list, ←/→ walks
         // recent dirs. Up/Down are safe to consume unconditionally (the
         // single-line TextEdit doesn't use them), but Left/Right only
@@ -333,6 +349,16 @@ fn term_in(state: &mut State, ui: &mut Ui) {
             if tab {
                 state.autocomplete_input();
                 response.request_focus();
+                // egui's TextEdit keeps its own caret position, which isn't
+                // updated when we replace the buffer behind its back. Move the
+                // caret to the end so it follows the completed path.
+                if let Some(mut edit_state) = TextEdit::load_state(ui.ctx(), response.id) {
+                    let end = egui::text::CCursor::new(state.ui.cli_input[active].chars().count());
+                    edit_state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                    edit_state.store(ui.ctx(), response.id);
+                }
             } else if up {
                 state.history_nav(true);
             } else if down {

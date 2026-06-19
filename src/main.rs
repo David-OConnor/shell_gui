@@ -376,14 +376,20 @@ pub fn run_command(state: &mut State, input: &str) {
 }
 
 fn main() {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT]),
-        ..Default::default()
-    };
-
     let state_path =
         save_data::default_path().unwrap_or_else(|| PathBuf::from(save_data::FILENAME));
     let state = State::load(state_path).unwrap_or_default();
+
+    // Reopen at the size the user left the window, falling back to the
+    // built-in default when there's no saved size yet.
+    let inner_size = state
+        .window_size
+        .map(|ws| [ws.x, ws.y])
+        .unwrap_or([WINDOW_WIDTH, WINDOW_HEIGHT]);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size(inner_size),
+        ..Default::default()
+    };
 
     eframe::run_native("Shell", options, Box::new(|_cc| Ok(Box::new(state)))).unwrap();
 }

@@ -5,8 +5,9 @@ use std::{
 
 use chrono::Utc;
 use shell::{
-    BrowserFile, HistoryItem, NavState, PanelVis, RecentDir, RemoteTerminal, apply_completion,
-    complete_cd_path, current_branch, get_home, read_browser_files, save_data, truncate_branch,
+    BrowserFile, HistoryItem, NavState, OpenTabs, PanelVis, RecentDir, RemoteTerminal, WindowSize,
+    apply_completion, complete_cd_path, current_branch, get_home, read_browser_files, save_data,
+    truncate_branch,
 };
 
 use crate::{OutItem, OutType, gui};
@@ -95,6 +96,10 @@ pub struct State {
     /// when that tab's cwd isn't inside a repo. Refreshed by
     /// `refresh_branch` after every command, cd, tab switch, or new tab.
     pub branch: Vec<Option<String>>,
+    /// Last observed window size, refreshed every frame from the viewport so
+    /// `save` persists the size the user left the window at. `None` until the
+    /// first frame reports a size (and on a fresh file with no saved value).
+    pub window_size: Option<WindowSize>,
 }
 
 impl Default for State {
@@ -113,6 +118,7 @@ impl Default for State {
             state_path: save_data::default_path()
                 .unwrap_or_else(|| PathBuf::from(save_data::FILENAME)),
             branch: vec![branch],
+            window_size: None,
         };
         s.refresh_all_filters();
         s.refresh_browser_files();
@@ -177,34 +183,69 @@ impl State {
     }
 
     pub fn save(&self) -> io::Result<()> {
+        // Persist the current tab layout (each tab's cwd, in order, plus the
+        // active index) so reopening the GUI restores the same tabs.
+        let open_tabs = OpenTabs {
+            paths: self.cwd.clone(),
+            active: self.ui.active_tab,
+        };
         save_data::save_state(
             &self.dir_bookmarks,
             &self.recent_dirs,
             &self.history,
             &self.remote_terminals,
             &self.ui.panel_vis,
+            self.window_size,
+            &open_tabs,
             &self.state_path,
         )
     }
 
     pub fn load(path: PathBuf) -> io::Result<Self> {
         let loaded = save_data::load_state(&path)?;
-        let cwd = env::current_dir().unwrap_or_default();
-        let branch = current_branch(&cwd);
+
+        // Restore the saved tabs. Drop any whose directory no longer exists
+        // (it may have been deleted or renamed since the last run); if none
+        // remain — or the file predates the feature — fall back to a single
+        // tab at the current directory.
+        let mut cwd: Vec<PathBuf> = loaded
+            .open_tabs
+            .paths
+            .into_iter()
+            .filter(|p| p.is_dir())
+            .collect();
+        if cwd.is_empty() {
+            cwd.push(env::current_dir().unwrap_or_default());
+        }
+
+        // Clamp the saved active index to the (possibly shrunken) tab list and
+        // point the process at that tab's cwd so the first command and the
+        // initial file listing match the selected tab.
+        let active_tab = loaded.open_tabs.active.min(cwd.len() - 1);
+        let _ = env::set_current_dir(&cwd[active_tab]);
+
+        let n = cwd.len();
+        let branch = cwd.iter().map(|c| current_branch(c)).collect();
 
         let mut ui = StateUi::default();
         ui.panel_vis = loaded.panel_vis;
+        ui.active_tab = active_tab;
+        ui.cli_input = vec![String::new(); n];
+        ui.out = (0..n).map(|_| Vec::new()).collect();
+        ui.history_nav = (0..n).map(|_| NavState::new()).collect();
+
         let mut s = Self {
             ui,
             home: get_home(),
             history: loaded.history,
-            cwd: vec![cwd],
+            cwd,
             dir_bookmarks: loaded.bookmarks,
             recent_dirs: loaded.recent_dirs,
             remote_terminals: loaded.remote_terminals,
             browser_files: Vec::new(),
             state_path: path,
-            branch: vec![branch],
+            branch,
+            window_size: loaded.window_size,
         };
         s.refresh_all_filters();
         s.refresh_browser_files();
@@ -454,6 +495,26 @@ impl State {
 
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Track the current window size each frame so `save` (which runs on
+        // every command) and `on_exit` persist whatever size the user has
+        // dragged the window to. `inner_rect` is the content area in logical
+        // points — what we hand back to `with_inner_size` on the next launch.
+        if let Some(rect) = ui.ctx().input(|i| i.viewport().inner_rect) {
+            let size = rect.size();
+            if size.x > 0.0 && size.y > 0.0 {
+                self.window_size = Some(WindowSize {
+                    x: size.x,
+                    y: size.y,
+                });
+            }
+        }
         gui::draw(self, ui);
+    }
+
+    /// Persist on close so a resize made without running any command (which
+    /// would otherwise be the only thing that triggers a save) still sticks.
+    /// Disambiguated to the inherent `save` — `eframe::App` also has a `save`.
+    fn on_exit(&mut self) {
+        let _ = State::save(self);
     }
 }
