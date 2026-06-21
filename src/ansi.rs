@@ -1,9 +1,7 @@
-//! Minimal ANSI SGR escape-sequence parser.
+//! An ANSI SGR escape-sequence parser.
 //!
 //! Shells like PowerShell emit sequences such as `ESC[32;1m` to colour their
-//! output. We parse those into styled segments so the GUI can render them as
-//! real colours instead of leaking the raw escape codes into the terminal
-//! pane.
+//! output. We parse those into styled segments so the GUI can render.
 
 use egui::{Color32, FontId, Stroke, TextFormat, text::LayoutJob};
 

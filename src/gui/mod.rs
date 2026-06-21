@@ -35,6 +35,11 @@ const CWD_HIST_COL_WIDTH: f32 = 240.;
 const BROWSER_COL_WIDTH: f32 = 220.;
 const REMOTE_COL_WIDTH: f32 = 200.;
 
+/// The main terminal output/input column must always keep at least this many
+/// points of width, no matter how wide the user drags the side panels (or how
+/// narrow they make the window). See [central_reserve].
+pub const MIN_CENTRAL_WIDTH: f32 = 400.;
+
 const COLOR_PROMPT: Color32 = Color32::from_rgb(220, 220, 90);
 const COLOR_STDOUT: Color32 = Color32::from_rgb(210, 210, 210);
 const COLOR_STDERR: Color32 = Color32::from_rgb(240, 110, 110);
@@ -335,84 +340,82 @@ fn term_in(state: &mut State, ui: &mut Ui) {
             );
         }
         ui.label(RichText::new("$").color(COLOR_PROMPT).monospace());
+    });
 
-        let response = ui.add(
-            TextEdit::singleline(&mut state.ui.cli_input[active])
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace),
-        );
+    // Input box sits on its own row, directly beneath the prompt line above.
+    let response = ui.add(
+        TextEdit::singleline(&mut state.ui.cli_input[active])
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
 
-        if state.ui.focus_input {
+    if state.ui.focus_input {
+        response.request_focus();
+        state.ui.focus_input = false;
+    }
+
+    // Stop egui from stealing Tab for widget-to-widget focus navigation:
+    // we use Tab ourselves for path autocompletion below. Locking the
+    // filter tells egui this widget consumes Tab, so focus stays in the
+    // input instead of jumping to the next button.
+    if response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    tab: true,
+                    ..Default::default()
+                },
+            );
+        });
+    }
+
+    // Arrow-key recall: ↑/↓ walks the global history list, ←/→ walks
+    // recent dirs. Up/Down are safe to consume unconditionally (the
+    // single-line TextEdit doesn't use them), but Left/Right only
+    // steal the keystroke when the buffer is empty or a cd recall is
+    // already active — otherwise they stay as normal caret movement.
+    if response.has_focus() || response.lost_focus() {
+        let tab = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
+        let up = !tab && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
+        let down = !tab && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
+        if tab {
+            state.autocomplete_input();
             response.request_focus();
-            state.ui.focus_input = false;
-        }
-
-        // Stop egui from stealing Tab for widget-to-widget focus navigation:
-        // we use Tab ourselves for path autocompletion below. Locking the
-        // filter tells egui this widget consumes Tab, so focus stays in the
-        // input instead of jumping to the next button.
-        if response.has_focus() {
-            ui.memory_mut(|m| {
-                m.set_focus_lock_filter(
-                    response.id,
-                    egui::EventFilter {
-                        tab: true,
-                        ..Default::default()
-                    },
-                );
-            });
-        }
-
-        // Arrow-key recall: ↑/↓ walks the global history list, ←/→ walks
-        // recent dirs. Up/Down are safe to consume unconditionally (the
-        // single-line TextEdit doesn't use them), but Left/Right only
-        // steal the keystroke when the buffer is empty or a cd recall is
-        // already active — otherwise they stay as normal caret movement.
-        if response.has_focus() || response.lost_focus() {
-            let tab = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
-            let up = !tab && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
-            let down =
-                !tab && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
-            if tab {
-                state.autocomplete_input();
-                response.request_focus();
-                // egui's TextEdit keeps its own caret position, which isn't
-                // updated when we replace the buffer behind its back. Move the
-                // caret to the end so it follows the completed path.
-                if let Some(mut edit_state) = TextEdit::load_state(ui.ctx(), response.id) {
-                    let end = egui::text::CCursor::new(state.ui.cli_input[active].chars().count());
-                    edit_state
-                        .cursor
-                        .set_char_range(Some(egui::text::CCursorRange::one(end)));
-                    edit_state.store(ui.ctx(), response.id);
-                }
-            } else if up {
-                state.history_nav(true);
-            } else if down {
-                state.history_nav(false);
-            } else {
-                let cd_active = cd_cursor.is_some() || state.ui.cli_input[active].is_empty();
-                if cd_active {
-                    let left =
-                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft));
-                    let right =
-                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowRight));
-                    if left {
-                        state.recent_dir_nav(true);
-                    } else if right {
-                        state.recent_dir_nav(false);
-                    }
+            // egui's TextEdit keeps its own caret position, which isn't
+            // updated when we replace the buffer behind its back. Move the
+            // caret to the end so it follows the completed path.
+            if let Some(mut edit_state) = TextEdit::load_state(ui.ctx(), response.id) {
+                let end = egui::text::CCursor::new(state.ui.cli_input[active].chars().count());
+                edit_state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                edit_state.store(ui.ctx(), response.id);
+            }
+        } else if up {
+            state.history_nav(true);
+        } else if down {
+            state.history_nav(false);
+        } else {
+            let cd_active = cd_cursor.is_some() || state.ui.cli_input[active].is_empty();
+            if cd_active {
+                let left = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft));
+                let right = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowRight));
+                if left {
+                    state.recent_dir_nav(true);
+                } else if right {
+                    state.recent_dir_nav(false);
                 }
             }
         }
+    }
 
-        let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        if submitted {
-            let input = std::mem::take(&mut state.ui.cli_input[active]);
-            run_command(state, &input);
-            state.ui.focus_input = true;
-        }
-    });
+    let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+    if submitted {
+        let input = std::mem::take(&mut state.ui.cli_input[active]);
+        run_command(state, &input);
+        state.ui.focus_input = true;
+    }
 }
 
 /// Files in the active tab's cwd, as a simple text column. Folders are
@@ -433,30 +436,63 @@ fn file_browser(state: &mut State, ui: &mut Ui) {
     let can_up = state.cwd().parent().is_some();
     let can_back = !state.ui.nav_back[i].is_empty();
     let can_forward = !state.ui.nav_forward[i].is_empty();
+    // Common-destination shortcuts. Home comes straight from `state.home`;
+    // Desktop/Downloads are the conventional sub-dirs that exist on both
+    // Windows and Linux. Each is only enabled when the target actually
+    // exists, so we never `cd` into a missing dir and push a diagnostic.
+    let home = state.home.clone();
+    let desktop = home.as_ref().map(|h| h.join("Desktop"));
+    let downloads = home.as_ref().map(|h| h.join("Downloads"));
     let mut go_up = false;
     let mut go_back = false;
     let mut go_forward = false;
+    let mut go_to: Option<PathBuf> = None;
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(can_up, egui::Button::new("Up"))
+            .add_enabled(can_up, egui::Button::new("⬆"))
             .on_hover_text("Parent directory")
             .clicked()
         {
             go_up = true;
         }
         if ui
-            .add_enabled(can_back, egui::Button::new("Back"))
+            .add_enabled(can_back, egui::Button::new("⬅"))
             .on_hover_text("Previous directory")
             .clicked()
         {
             go_back = true;
         }
         if ui
-            .add_enabled(can_forward, egui::Button::new("Forward"))
+            .add_enabled(can_forward, egui::Button::new("➡"))
             .on_hover_text("Next directory")
             .clicked()
         {
             go_forward = true;
+        }
+        // Glyph buttons: 🏠 Home, 🖥 Desktop, 📥 Downloads.
+        let home_ok = home.as_ref().is_some_and(|h| h.is_dir());
+        if ui
+            .add_enabled(home_ok, egui::Button::new("🏠"))
+            .on_hover_text("Home directory")
+            .clicked()
+        {
+            go_to = home.clone();
+        }
+        let desktop_ok = desktop.as_ref().is_some_and(|d| d.is_dir());
+        if ui
+            .add_enabled(desktop_ok, egui::Button::new("🖥"))
+            .on_hover_text("Desktop")
+            .clicked()
+        {
+            go_to = desktop.clone();
+        }
+        let downloads_ok = downloads.as_ref().is_some_and(|d| d.is_dir());
+        if ui
+            .add_enabled(downloads_ok, egui::Button::new("📥"))
+            .on_hover_text("Downloads")
+            .clicked()
+        {
+            go_to = downloads.clone();
         }
     });
     if go_up {
@@ -465,6 +501,8 @@ fn file_browser(state: &mut State, ui: &mut Ui) {
         state.nav_back();
     } else if go_forward {
         state.nav_forward();
+    } else if let Some(target) = go_to {
+        state.change_dir(target);
     }
 
     ui.separator();
@@ -610,6 +648,18 @@ fn tabs_bar(state: &mut State, ui: &mut Ui) {
     }
 }
 
+/// Cap a resizable side panel so the central output/input column keeps at
+/// least [MIN_CENTRAL_WIDTH] points. `ui` is queried for the width still
+/// available at the point the panel is about to be added (egui lays panels out
+/// sequentially, so this already excludes any earlier panels). Because we
+/// reserve the floor at every panel, the space left over for the central panel
+/// can never fall below the floor. `existing_max` lets a panel keep its own
+/// tighter cap; pass `f32::INFINITY` if it has none.
+fn central_reserve(ui: &Ui, existing_max: f32) -> f32 {
+    let reserve = (ui.available_width() - MIN_CENTRAL_WIDTH).max(0.0);
+    existing_max.min(reserve)
+}
+
 pub fn draw(state: &mut State, ui: &mut Ui) {
     Panel::top("tabs_panel")
         .resizable(false)
@@ -619,36 +669,44 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
         });
 
     if state.ui.panel_vis.bookmarks {
+        let max = central_reserve(ui, f32::INFINITY);
         Panel::left("bookmarks_panel")
             .resizable(true)
             .default_size(BOOKMARK_COL_WIDTH)
+            .max_size(max)
             .show_inside(ui, |ui| {
                 dir_bookmarks(state, ui);
             });
     }
 
     if state.ui.panel_vis.recent_dirs {
+        let max = central_reserve(ui, f32::INFINITY);
         Panel::left("recent_dirs_panel")
             .resizable(true)
             .default_size(RECENT_DIRS_COL_WIDTH)
+            .max_size(max)
             .show_inside(ui, |ui| {
                 dir_history(state, ui);
             });
     }
 
     if state.ui.panel_vis.file_browser {
+        let max = central_reserve(ui, f32::INFINITY);
         Panel::left("file_browser_panel")
             .resizable(true)
             .default_size(BROWSER_COL_WIDTH)
+            .max_size(max)
             .show_inside(ui, |ui| {
                 file_browser(state, ui);
             });
     }
 
     if state.ui.panel_vis.remote_terminals {
+        let max = central_reserve(ui, f32::INFINITY);
         Panel::left("remote_terminals_panel")
             .resizable(true)
             .default_size(REMOTE_COL_WIDTH)
+            .max_size(max)
             .show_inside(ui, |ui| {
                 remote_terminals(state, ui);
             });
@@ -657,20 +715,24 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
     if state.ui.panel_vis.recent_cmds {
         // Cap the cmd-history panel at 200px wide so long commands don't
         // blow out its column; rows wrap inside it instead. `max_size`
-        // still allows shrinking via the drag handle.
+        // still allows shrinking via the drag handle, and the central
+        // reserve keeps it from crowding out the terminal column.
+        let max = central_reserve(ui, RIGHT_COL_WIDTH);
         Panel::right("cmd_history_panel")
             .resizable(true)
             .default_size(RIGHT_COL_WIDTH)
-            .max_size(RIGHT_COL_WIDTH)
+            .max_size(max)
             .show_inside(ui, |ui| {
                 cmd_history(state, ui);
             });
     }
 
     if state.ui.panel_vis.recent_cmds_in_dir {
+        let max = central_reserve(ui, f32::INFINITY);
         Panel::right("cwd_cmd_history_panel")
             .resizable(true)
             .default_size(CWD_HIST_COL_WIDTH)
+            .max_size(max)
             .show_inside(ui, |ui| {
                 cwd_cmd_history(state, ui);
             });
