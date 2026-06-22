@@ -4,6 +4,7 @@ use egui::{
     CentralPanel, Color32, Frame, Key, Label, Panel, RichText, ScrollArea, Sense, TextEdit,
     TextWrapMode, Ui,
 };
+use shell::SshMode;
 
 /// Renders a single-line "Search..." box that fills the available width and
 /// triggers `on_changed` when the buffer is edited. Pulled out so all three
@@ -26,19 +27,24 @@ pub const WINDOW_HEIGHT: f32 = 900.;
 /// Bookmarks column. Narrower than the other side columns: bookmark paths are
 /// truncated to [BOOKMARK_MAX_LEN] chars, so this only needs to fit the
 /// `"<i>: "` prefix plus that path and the trailing `x` button.
-const BOOKMARK_COL_WIDTH: f32 = 190.;
+const BOOKMARK_COL_WIDTH: f32 = 170.;
 /// Recent-dirs column. Paths are truncated to [BOOKMARK_MAX_LEN] chars like
 /// bookmarks; slightly wider to fit the extra `*` (bookmarked) marker.
-const RECENT_DIRS_COL_WIDTH: f32 = 195.;
-const RIGHT_COL_WIDTH: f32 = 200.;
-const CWD_HIST_COL_WIDTH: f32 = 240.;
-const BROWSER_COL_WIDTH: f32 = 220.;
-const REMOTE_COL_WIDTH: f32 = 200.;
+const RECENT_DIRS_COL_WIDTH: f32 = 175.;
+const RIGHT_COL_WIDTH: f32 = 180.;
+const CWD_HIST_COL_WIDTH: f32 = 220.;
+const BROWSER_COL_WIDTH: f32 = 200.;
+const REMOTE_COL_WIDTH: f32 = 180.;
 
 /// The main terminal output/input column must always keep at least this many
 /// points of width, no matter how wide the user drags the side panels (or how
 /// narrow they make the window). See [central_reserve].
 pub const MIN_CENTRAL_WIDTH: f32 = 400.;
+
+/// Points shaved off every text style in the side panels (and the top tab
+/// strip), so they read slightly smaller than the main terminal column.
+/// See [shrink_panel_fonts].
+const PANEL_FONT_REDUCTION: f32 = 2.;
 
 const COLOR_PROMPT: Color32 = Color32::from_rgb(220, 220, 90);
 const COLOR_STDOUT: Color32 = Color32::from_rgb(210, 210, 210);
@@ -60,6 +66,12 @@ enum ListAction {
     /// Re-run the history item at this index in its original working dir,
     /// without changing the GUI's CWD. Delegates to the `hisd` built-in.
     RunHistoryInDir(usize),
+    /// Connect the active tab to the saved remote at this index.
+    ConnectRemote(usize),
+    /// Load the saved remote at this index into the add/edit form.
+    EditRemote(usize),
+    /// Delete the saved remote at this index (and its keyring password).
+    RemoveRemote(usize),
 }
 
 /// Max displayed length (in characters) of a bookmark's path. Longer paths
@@ -276,6 +288,18 @@ fn apply_action(state: &mut State, action: Option<ListAction>) {
             // stays in one place (run_command in main.rs).
             run_command(state, &format!("hisd {i}"));
         }
+        Some(ListAction::ConnectRemote(i)) => state.connect_remote(i),
+        Some(ListAction::EditRemote(i)) => {
+            if let Some(r) = state.remote_terminals.get(i) {
+                state.ui.remote_host = r.host.clone();
+                state.ui.remote_port = r.port.to_string();
+                state.ui.remote_user = r.username.clone();
+                state.ui.remote_password.clear();
+                state.ui.remote_edit_idx = Some(i);
+                state.ui.remote_form_open = true;
+            }
+        }
+        Some(ListAction::RemoveRemote(i)) => state.remove_remote(i),
         None => {}
     }
 }
@@ -316,14 +340,19 @@ fn term_in(state: &mut State, ui: &mut Ui) {
     let (his_cursor, cd_cursor) = state.active_nav_cursors();
     let cwd_part = state.cwd_display();
     let branch = state.branch[active].clone();
+    // While remote, the cwd label already shows `user@host`; don't also show
+    // the (stale) local git branch.
+    let show_branch = !state.is_remote();
     ui.horizontal(|ui| {
         ui.label(RichText::new(cwd_part).color(COLOR_PROMPT).monospace());
         if let Some(b) = branch {
-            ui.label(
-                RichText::new(format!("branch: {}", shell::truncate_branch(&b, 10)))
-                    .color(COLOR_BRANCH)
-                    .monospace(),
-            );
+            if show_branch {
+                ui.label(
+                    RichText::new(format!("branch: {}", shell::truncate_branch(&b, 10)))
+                        .color(COLOR_BRANCH)
+                        .monospace(),
+                );
+            }
         }
         if let Some(i) = his_cursor {
             ui.label(
@@ -413,7 +442,18 @@ fn term_in(state: &mut State, ui: &mut Ui) {
     let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
     if submitted {
         let input = std::mem::take(&mut state.ui.cli_input[active]);
-        run_command(state, &input);
+        // In interactive (PTY) mode the line goes straight to the remote shell,
+        // which echoes it back — so we don't run it as a command or echo it
+        // locally. Exec mode (and all local tabs) go through `run_command`.
+        let pty = state
+            .active_remote()
+            .map(|s| s.mode() == shell::SshMode::Pty)
+            .unwrap_or(false);
+        if pty {
+            state.send_remote_line(&input);
+        } else {
+            run_command(state, &input);
+        }
         state.ui.focus_input = true;
     }
 }
@@ -540,26 +580,154 @@ fn file_browser(state: &mut State, ui: &mut Ui) {
     apply_action(state, action);
 }
 
-/// Saved remote-terminal entries. Minimal for now — one row per host,
-/// `username@host:port`. No actions wired up yet; the panel exists so
-/// the visibility toggle has something to show, and so the data round-
-/// trips through the save file.
+/// Saved SSH remotes. Lists each `user@host:port` with Connect / Edit / delete
+/// controls, an add/edit form, and — when the active tab is connected — a
+/// status line with Disconnect and an Exec⇄PTY mode toggle. Passwords are kept
+/// in the OS keyring (see `shell::secrets`), never in the panel or state file.
 fn remote_terminals(state: &mut State, ui: &mut Ui) {
     ui.heading("Remote");
+
+    // Connection status for the active tab.
+    if let Some(remote) = state.active_remote() {
+        let label = remote.label();
+        let mode = match remote.mode() {
+            shell::SshMode::Exec => "exec",
+            shell::SshMode::Pty => "interactive",
+        };
+        ui.label(
+            RichText::new(format!("● {label}  [{mode}]"))
+                .color(COLOR_EXECUTABLE)
+                .strong(),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Disconnect").clicked() {
+                state.disconnect_remote();
+            }
+
+            let mut label = "Exec mode";
+            if let Some(s) = state.active_remote() {
+                if let SshMode::Pty = s.mode() {
+                    label = "PTY mode";
+                }
+            }
+
+            if ui
+                .button(label)
+                .on_hover_text("Toggle between per-command and interactive shell mode")
+                .clicked()
+            {
+                state.toggle_remote_mode();
+            }
+        });
+        ui.separator();
+    }
+
+    // Add / edit form toggle.
+    ui.horizontal(|ui| {
+        let label = if state.ui.remote_form_open {
+            "Close form"
+        } else {
+            "＋ Add remote"
+        };
+        if ui.button(label).clicked() {
+            state.ui.remote_form_open = !state.ui.remote_form_open;
+            if !state.ui.remote_form_open {
+                state.ui.remote_edit_idx = None;
+            }
+        }
+    });
+
+    if state.ui.remote_form_open {
+        remote_form(state, ui);
+    }
+
     ui.separator();
+
+    let mut action: Option<ListAction> = None;
 
     ScrollArea::vertical()
         .id_salt("remote_terminals_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             if state.remote_terminals.is_empty() {
-                ui.label(RichText::new("(none)").italics());
+                ui.label(RichText::new("(no saved remotes)").italics());
                 return;
             }
-            for rt in &state.remote_terminals {
-                ui.label(format!("{}@{}:{}", rt.username, rt.host, rt.port));
+            for (i, rt) in state.remote_terminals.iter().enumerate() {
+                ui.label(format!("{i}: {}@{}:{}", rt.username, rt.host, rt.port));
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        action = Some(ListAction::ConnectRemote(i));
+                    }
+                    if ui.small_button("Edit").clicked() {
+                        action = Some(ListAction::EditRemote(i));
+                    }
+                    if ui.small_button("x").on_hover_text("Delete remote").clicked() {
+                        action = Some(ListAction::RemoveRemote(i));
+                    }
+                });
+                ui.separator();
             }
         });
+
+    apply_action(state, action);
+}
+
+/// The add/edit form for a saved remote. Writes through
+/// [State::save_remote_from_form] on Save (storing the password in the keyring
+/// when one was entered).
+fn remote_form(state: &mut State, ui: &mut Ui) {
+    egui::Grid::new("remote_form_grid")
+        .num_columns(2)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Host");
+            ui.add(
+                TextEdit::singleline(&mut state.ui.remote_host)
+                    .hint_text("example.com")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+
+            ui.label("Port");
+            ui.add(
+                TextEdit::singleline(&mut state.ui.remote_port)
+                    .hint_text("22")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+
+            ui.label("User");
+            ui.add(
+                TextEdit::singleline(&mut state.ui.remote_user)
+                    .hint_text("root")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+
+            ui.label("Password");
+            ui.add(
+                TextEdit::singleline(&mut state.ui.remote_password)
+                    .password(true)
+                    .hint_text("(stored in OS keyring)")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+        });
+
+    ui.horizontal(|ui| {
+        if ui.button("Save").clicked() {
+            if let Err(e) = state.save_remote_from_form() {
+                state.push_out(format!("remote: {e}"), OutType::StdErr);
+            }
+        }
+        if ui.button("Cancel").clicked() {
+            state.ui.remote_form_open = false;
+            state.ui.remote_edit_idx = None;
+            state.ui.remote_password.clear();
+        }
+    });
 }
 
 /// Row of show/hide toggles for the optional side panels. Lives in the
@@ -660,10 +828,27 @@ fn central_reserve(ui: &Ui, existing_max: f32) -> f32 {
     existing_max.min(reserve)
 }
 
+/// Shrink every text style in `ui` by [PANEL_FONT_REDUCTION] points. Called at
+/// the top of each side panel's content closure so it only affects that
+/// panel's child `ui`, leaving the main terminal column at the default size.
+fn shrink_panel_fonts(ui: &mut Ui) {
+    for font_id in ui.style_mut().text_styles.values_mut() {
+        font_id.size = (font_id.size - PANEL_FONT_REDUCTION).max(1.0);
+    }
+}
+
 pub fn draw(state: &mut State, ui: &mut Ui) {
+    // Pump any live PTY output into the active tab's pane. While a PTY session
+    // is active, keep requesting repaints so streamed output (e.g. `top`) keeps
+    // flowing even when the user isn't interacting.
+    if state.pump_pty() {
+        ui.ctx().request_repaint();
+    }
+
     Panel::top("tabs_panel")
         .resizable(false)
         .show_inside(ui, |ui| {
+            shrink_panel_fonts(ui);
             tabs_bar(state, ui);
             panel_toggles(state, ui);
         });
@@ -675,6 +860,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             .default_size(BOOKMARK_COL_WIDTH)
             .max_size(max)
             .show_inside(ui, |ui| {
+                shrink_panel_fonts(ui);
                 dir_bookmarks(state, ui);
             });
     }
@@ -686,6 +872,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             .default_size(RECENT_DIRS_COL_WIDTH)
             .max_size(max)
             .show_inside(ui, |ui| {
+                shrink_panel_fonts(ui);
                 dir_history(state, ui);
             });
     }
@@ -697,6 +884,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             .default_size(BROWSER_COL_WIDTH)
             .max_size(max)
             .show_inside(ui, |ui| {
+                shrink_panel_fonts(ui);
                 file_browser(state, ui);
             });
     }
@@ -708,6 +896,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             .default_size(REMOTE_COL_WIDTH)
             .max_size(max)
             .show_inside(ui, |ui| {
+                shrink_panel_fonts(ui);
                 remote_terminals(state, ui);
             });
     }
@@ -723,6 +912,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             .default_size(RIGHT_COL_WIDTH)
             .max_size(max)
             .show_inside(ui, |ui| {
+                shrink_panel_fonts(ui);
                 cmd_history(state, ui);
             });
     }
@@ -734,6 +924,7 @@ pub fn draw(state: &mut State, ui: &mut Ui) {
             .default_size(CWD_HIST_COL_WIDTH)
             .max_size(max)
             .show_inside(ui, |ui| {
+                shrink_panel_fonts(ui);
                 cwd_cmd_history(state, ui);
             });
     }

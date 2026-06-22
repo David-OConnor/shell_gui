@@ -5,9 +5,9 @@ use std::{
 
 use chrono::Utc;
 use shell::{
-    BrowserFile, HistoryItem, NavState, OpenTabs, PanelVis, RecentDir, RemoteTerminal, WindowSize,
-    apply_completion, complete_cd_path, current_branch, get_home, read_browser_files, save_data,
-    truncate_branch,
+    BrowserFile, HistoryItem, NavState, OpenTabs, PanelVis, RecentDir, RemoteSession, RemoteTerminal,
+    SshMode, WindowSize, apply_completion, complete_cd_path, current_branch, get_home,
+    read_browser_files, save_data, secrets, ssh, truncate_branch,
 };
 
 use crate::{OutItem, OutType, gui};
@@ -59,6 +59,17 @@ pub struct StateUi {
     /// persisted (a fresh session starts with empty stacks).
     pub nav_back: Vec<Vec<PathBuf>>,
     pub nav_forward: Vec<Vec<PathBuf>>,
+
+    /// Remote-panel "add / edit remote" form state. `remote_form_open` shows
+    /// the form; the text fields hold the in-progress entry; `remote_edit_idx`
+    /// is `Some(i)` when editing an existing saved remote rather than adding a
+    /// new one.
+    pub remote_form_open: bool,
+    pub remote_host: String,
+    pub remote_port: String,
+    pub remote_user: String,
+    pub remote_password: String,
+    pub remote_edit_idx: Option<usize>,
 }
 
 impl Default for StateUi {
@@ -80,6 +91,12 @@ impl Default for StateUi {
             panel_vis: PanelVis::default(),
             nav_back: vec![Vec::new()],
             nav_forward: vec![Vec::new()],
+            remote_form_open: false,
+            remote_host: String::new(),
+            remote_port: String::new(),
+            remote_user: String::new(),
+            remote_password: String::new(),
+            remote_edit_idx: None,
         }
     }
 }
@@ -98,6 +115,10 @@ pub struct State {
     /// Paths we've execute commands from. Works in a similar way to bookmarks.
     pub recent_dirs: Vec<RecentDir>,
     pub remote_terminals: Vec<RemoteTerminal>,
+    /// Live SSH session per tab (parallel to `cwd`). `Some` once a tab connects
+    /// via the Remote panel; while set, that tab's typed commands run on the
+    /// remote. Not persisted (a connection can't outlive the process).
+    pub active_remote: Vec<Option<RemoteSession>>,
     /// In the current dir. Note persistent, unlike some of our other lists.
     pub browser_files: Vec<BrowserFile>,
     /// Where bookmarks + recent dirs are persisted.
@@ -124,6 +145,7 @@ impl Default for State {
             dir_bookmarks: Vec::new(),
             recent_dirs: Vec::new(),
             remote_terminals: Vec::new(),
+            active_remote: vec![None],
             browser_files: Vec::new(),
             state_path: save_data::default_path()
                 .unwrap_or_else(|| PathBuf::from(save_data::FILENAME)),
@@ -141,10 +163,30 @@ impl State {
     /// input row which renders the branch + nav indicators as separately
     /// coloured labels (see `gui::term_in`).
     pub fn cwd_display(&self) -> String {
+        // When the active tab is connected, show the remote location instead of
+        // the local cwd so the user knows commands are running remotely.
+        if let Some(remote) = self.active_remote() {
+            let cwd = if remote.cwd().is_empty() {
+                "~"
+            } else {
+                remote.cwd()
+            };
+            let mode = match remote.mode() {
+                SshMode::Exec => "",
+                SshMode::Pty => " (pty)",
+            };
+            return format!("{}:{}{}", remote.label(), cwd, mode);
+        }
         let cwd = self.cwd();
         let bookmarked = self.dir_bookmarks.iter().any(|p| p.as_path() == cwd);
         let star = if bookmarked { "*" } else { "" };
         format!("{star}{}", cwd.display())
+    }
+
+    /// Whether the active tab has a live SSH session (used by the input row to
+    /// suppress the local git-branch label while remote).
+    pub fn is_remote(&self) -> bool {
+        self.active_remote().is_some()
     }
 
     /// Full prompt prefix used when echoing a command into the output
@@ -154,10 +196,16 @@ impl State {
     /// after the branch when a recall is active (see [NavState]).
     pub fn prompt(&self, nav: &NavState) -> String {
         let i = self.ui.active_tab;
-        let branch_part = self.branch[i]
-            .as_deref()
-            .map(|b| format!(" \x1b[95mbranch: {}\x1b[0m", truncate_branch(b, 10)))
-            .unwrap_or_default();
+        // No local git branch while remote — `cwd_display` already shows the
+        // remote location.
+        let branch_part = if self.is_remote() {
+            String::new()
+        } else {
+            self.branch[i]
+                .as_deref()
+                .map(|b| format!(" \x1b[95mbranch: {}\x1b[0m", truncate_branch(b, 10)))
+                .unwrap_or_default()
+        };
         format!(
             "{}{}{}{}",
             self.cwd_display(),
@@ -254,6 +302,7 @@ impl State {
             dir_bookmarks: loaded.bookmarks,
             recent_dirs: loaded.recent_dirs,
             remote_terminals: loaded.remote_terminals,
+            active_remote: (0..n).map(|_| None).collect(),
             browser_files: Vec::new(),
             state_path: path,
             branch,
@@ -291,6 +340,8 @@ impl State {
         self.ui.nav_back.push(Vec::new());
         self.ui.nav_forward.push(Vec::new());
         self.branch.push(inherited_branch);
+        // New tabs start local; a connection isn't inherited.
+        self.active_remote.push(None);
 
         self.ui.active_tab = self.cwd.len() - 1;
         self.ui.focus_input = true;
@@ -312,6 +363,10 @@ impl State {
         self.ui.nav_back.remove(idx);
         self.ui.nav_forward.remove(idx);
         self.branch.remove(idx);
+        // Tear down any SSH session attached to the closed tab.
+        if let Some(session) = self.active_remote.remove(idx) {
+            session.disconnect();
+        }
 
         if self.ui.active_tab >= self.cwd.len() {
             self.ui.active_tab = self.cwd.len() - 1;
@@ -559,6 +614,204 @@ impl State {
         if self.navigate_to(target) {
             self.ui.nav_back[i].push(before);
         }
+    }
+
+    // --- SSH ------------------------------------------------------------
+
+    /// The active tab's live SSH session, if any.
+    pub fn active_remote(&self) -> Option<&RemoteSession> {
+        self.active_remote[self.ui.active_tab].as_ref()
+    }
+
+    /// Connect the active tab to the saved remote at `idx`. The password comes
+    /// from the OS keyring (saved when the remote was added); a missing one is
+    /// reported rather than prompting (the GUI can't host a blocking prompt
+    /// mid-frame — the user re-saves it via the Remote panel form). Blocks the
+    /// UI thread for the duration of the connect, like a shelled-out command.
+    pub fn connect_remote(&mut self, idx: usize) {
+        let Some(rt) = self.remote_terminals.get(idx) else {
+            return;
+        };
+        let (host, port, user) = (rt.host.clone(), rt.port, rt.username.clone());
+
+        let Some(password) = secrets::get_password(&host, port, &user) else {
+            self.push_out(
+                format!("ssh: no saved password for {user}@{host}; edit the remote to add one"),
+                OutType::StdErr,
+            );
+            return;
+        };
+
+        self.push_out(format!("Connecting to {user}@{host}:{port} …"), OutType::Prompt);
+        match ssh::connect(&host, port, &user, &password) {
+            Ok(session) => {
+                let i = self.ui.active_tab;
+                self.active_remote[i] = Some(session);
+                self.push_out(format!("Connected to {user}@{host}"), OutType::StdOut);
+            }
+            Err(e) => self.push_out(format!("ssh: {e}"), OutType::StdErr),
+        }
+    }
+
+    /// Disconnect the active tab's session, if any.
+    pub fn disconnect_remote(&mut self) {
+        let i = self.ui.active_tab;
+        if let Some(session) = self.active_remote[i].take() {
+            session.disconnect();
+            self.push_out("ssh: disconnected", OutType::StdOut);
+        }
+    }
+
+    /// Flip the active tab's session between exec and PTY mode.
+    pub fn toggle_remote_mode(&mut self) {
+        let i = self.ui.active_tab;
+        let res = self.active_remote[i].as_mut().map(|s| {
+            let next = match s.mode() {
+                SshMode::Exec => SshMode::Pty,
+                SshMode::Pty => SshMode::Exec,
+            };
+            (next, s.set_mode(next))
+        });
+
+        if let Some((next, r)) = res {
+            match r {
+                Ok(()) => self.push_out(
+                    format!(
+                        "ssh: switched to {} mode",
+                        if next == SshMode::Pty { "interactive" } else { "exec" }
+                    ),
+                    OutType::StdOut,
+                ),
+                Err(e) => self.push_out(format!("ssh: {e}"), OutType::StdErr),
+            }
+        }
+    }
+
+    /// Run one command on the active tab's remote in exec mode, buffering the
+    /// output and pushing it into the pane afterwards. We `take` the session
+    /// out of `self` for the call so `RemoteSession::run` (which needs `&mut
+    /// self`) doesn't clash with the `&mut self` borrow `push_out` needs.
+    pub fn run_remote_exec(&mut self, input: &str) {
+        let i = self.ui.active_tab;
+        let Some(mut session) = self.active_remote[i].take() else {
+            return;
+        };
+        let mut lines: Vec<(OutType, String)> = Vec::new();
+        let result = session.run(input, &mut |kind, msg| {
+            lines.push((crate::out_type_for(kind), msg));
+        });
+        self.active_remote[i] = Some(session);
+
+        for (t, m) in lines {
+            self.push_out(m, t);
+        }
+        if let Err(e) = result {
+            self.push_out(format!("ssh: {e}"), OutType::StdErr);
+        }
+    }
+
+    /// Send a line of input to the active tab's PTY session (the remote echoes
+    /// it back, so we don't echo locally).
+    pub fn send_remote_line(&mut self, line: &str) {
+        if let Some(session) = self.active_remote() {
+            let mut bytes = line.as_bytes().to_vec();
+            bytes.push(b'\r');
+            let _ = session.send(&bytes);
+        }
+    }
+
+    /// Drain any live PTY output for the active tab into the output pane and,
+    /// if the remote shell has closed, drop back to local. Returns `true` when
+    /// a PTY session is active (so the caller keeps requesting repaints to keep
+    /// output flowing). Called once per frame.
+    pub fn pump_pty(&mut self) -> bool {
+        let i = self.ui.active_tab;
+        let (text, closed) = match self.active_remote[i].as_ref() {
+            Some(s) if s.mode() == SshMode::Pty => {
+                let bytes = s.drain_output();
+                (String::from_utf8_lossy(&bytes).into_owned(), s.pty_closed())
+            }
+            _ => return false,
+        };
+        if !text.is_empty() {
+            self.push_out(text, OutType::StdOut);
+        }
+        if closed {
+            if let Some(session) = self.active_remote[i].take() {
+                session.disconnect();
+            }
+            self.push_out("ssh: remote shell exited; disconnected", OutType::StdOut);
+            return false;
+        }
+        true
+    }
+
+    /// Delete a saved remote and its keyring password.
+    pub fn remove_remote(&mut self, idx: usize) {
+        if idx >= self.remote_terminals.len() {
+            return;
+        }
+        let r = self.remote_terminals.remove(idx);
+        let _ = secrets::delete_password(&r.host, r.port, &r.username);
+        let _ = self.save();
+        self.push_out(
+            format!("Removed remote {}@{}:{}", r.username, r.host, r.port),
+            OutType::StdOut,
+        );
+    }
+
+    /// Save (or update) a remote from the Remote-panel form fields, storing its
+    /// password in the keyring when one was entered. `edit_idx` updates an
+    /// existing entry in place; `None` adds a new one (deduped on
+    /// host/port/user). Returns an error string for the caller to surface.
+    pub fn save_remote_from_form(&mut self) -> Result<(), String> {
+        let host = self.ui.remote_host.trim().to_string();
+        if host.is_empty() {
+            return Err("host is required".to_string());
+        }
+        let user = {
+            let u = self.ui.remote_user.trim();
+            if u.is_empty() { "root".to_string() } else { u.to_string() }
+        };
+        let port: u16 = match self.ui.remote_port.trim() {
+            "" => 22,
+            p => p.parse().map_err(|_| format!("invalid port `{p}`"))?,
+        };
+
+        if !self.ui.remote_password.is_empty() {
+            secrets::set_password(&host, port, &user, &self.ui.remote_password)
+                .map_err(|e| format!("couldn't save password: {e}"))?;
+        }
+
+        match self.ui.remote_edit_idx {
+            Some(i) if i < self.remote_terminals.len() => {
+                self.remote_terminals[i] = RemoteTerminal {
+                    host,
+                    port,
+                    username: user,
+                };
+            }
+            _ => {
+                self.remote_terminals
+                    .retain(|r| !(r.host == host && r.port == port && r.username == user));
+                self.remote_terminals.push(RemoteTerminal {
+                    host,
+                    port,
+                    username: user,
+                });
+            }
+        }
+
+        let _ = self.save();
+
+        // Reset the form.
+        self.ui.remote_form_open = false;
+        self.ui.remote_edit_idx = None;
+        self.ui.remote_host.clear();
+        self.ui.remote_port.clear();
+        self.ui.remote_user.clear();
+        self.ui.remote_password.clear();
+        Ok(())
     }
 }
 

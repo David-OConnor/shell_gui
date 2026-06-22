@@ -15,6 +15,19 @@ pub fn read_file(path: &Path) -> io::Result<String> {
 /// Note: In `shell`, this is in the `commands` module. To prevent possible confusion, we don't
 /// have an additoinal `commands` module in this program.
 pub fn handle_cmd(state: &mut State, cmd: &str, input: &str, args: &str) {
+    // While the active tab is connected, route commands to the remote. Only
+    // the session-management keywords are intercepted; everything else (exec
+    // mode) runs on the remote shell. (PTY-mode input is sent directly from the
+    // input row, not here — see `gui::term_in`.)
+    if state.active_remote().is_some() {
+        match cmd {
+            "exit" | "quit" | "logout" | "disconnect" => state.disconnect_remote(),
+            "mode" => state.toggle_remote_mode(),
+            _ => state.run_remote_exec(input),
+        }
+        return;
+    }
+
     match cmd {
         "exit" | "quit" => {
             state.push_out("(use the window close button to exit)", OutType::StdErr);
