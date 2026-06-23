@@ -61,6 +61,9 @@ const COLOR_EXECUTABLE: Color32 = Color32::from_rgb(120, 220, 120);
 /// applied afterwards, so the borrow checker is happy.
 enum ListAction {
     ChangeDir(PathBuf),
+    /// Open a file with the OS's default associated program, the way a
+    /// double-click does in Explorer / a Linux file manager.
+    OpenFile(PathBuf),
     RemoveBookmark(usize),
     FillInput(String),
     /// Re-run the history item at this index in its original working dir,
@@ -264,9 +267,49 @@ fn cmd_history(state: &mut State, ui: &mut Ui) {
     apply_action(state, action);
 }
 
+/// Open `path` with the operating system's default associated program, the
+/// same way double-clicking it in Explorer (Windows) or a file manager
+/// (Linux) would. The launcher is detached: we `spawn` rather than `output`
+/// so the GUI doesn't block while the program runs.
+///
+/// - Windows: `cmd /C start "" "<path>"`. The empty `""` is the window-title
+///   argument `start` consumes first when the path itself is quoted.
+/// - macOS: `open <path>`.
+/// - Other (Linux/BSD): `xdg-open <path>`.
+fn open_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::Command;
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", ""]).arg(path);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    cmd.spawn().map(|_| ())
+}
+
 fn apply_action(state: &mut State, action: Option<ListAction>) {
     match action {
         Some(ListAction::ChangeDir(p)) => state.change_dir(p),
+        Some(ListAction::OpenFile(p)) => {
+            if let Err(e) = open_with_default_app(&p) {
+                state.push_out(
+                    format!("open: failed to open {}: {e}", p.display()),
+                    OutType::StdErr,
+                );
+            }
+        }
         Some(ListAction::RemoveBookmark(i)) => {
             if i < state.dir_bookmarks.len() {
                 let path = state.dir_bookmarks.remove(i);
@@ -447,8 +490,9 @@ fn term_in(state: &mut State, ui: &mut Ui) {
         // locally. Exec mode (and all local tabs) go through `run_command`.
         let pty = state
             .active_remote()
-            .map(|s| s.mode() == shell::SshMode::Pty)
+            .map(|s| s.mode() == SshMode::Pty)
             .unwrap_or(false);
+
         if pty {
             state.send_remote_line(&input);
         } else {
@@ -465,7 +509,8 @@ fn term_in(state: &mut State, ui: &mut Ui) {
 /// command, so we just read what's already there.
 ///
 /// Double-clicking a folder row navigates into it (same path as
-/// clicking a bookmark or recent dir).
+/// clicking a bookmark or recent dir); double-clicking a file opens it
+/// with the OS's default associated program (see [open_with_default_app]).
 fn file_browser(state: &mut State, ui: &mut Ui) {
     ui.heading("Files");
 
@@ -563,16 +608,17 @@ fn file_browser(state: &mut State, ui: &mut Ui) {
                 if !f.is_folder && f.is_executable {
                     rich = rich.color(COLOR_EXECUTABLE);
                 }
-                // Folders get a click sense so we can detect the
-                // double-click; files stay as plain labels (no action
-                // wired up for them yet).
-                if f.is_folder {
-                    let resp = ui.add(Label::new(rich).sense(Sense::click()));
-                    if resp.double_clicked() {
-                        action = Some(ListAction::ChangeDir(f.path.clone()));
-                    }
-                } else {
-                    ui.label(rich);
+                // Both folders and files get a click sense so we can detect
+                // the double-click. Double-clicking a folder navigates into
+                // it; double-clicking a file opens it with its associated
+                // program, just like a desktop file manager.
+                let resp = ui.add(Label::new(rich).sense(Sense::click()));
+                if resp.double_clicked() {
+                    action = Some(if f.is_folder {
+                        ListAction::ChangeDir(f.path.clone())
+                    } else {
+                        ListAction::OpenFile(f.path.clone())
+                    });
                 }
             }
         });
@@ -591,8 +637,8 @@ fn remote_terminals(state: &mut State, ui: &mut Ui) {
     if let Some(remote) = state.active_remote() {
         let label = remote.label();
         let mode = match remote.mode() {
-            shell::SshMode::Exec => "exec",
-            shell::SshMode::Pty => "interactive",
+            SshMode::Exec => "exec",
+            SshMode::Pty => "interactive",
         };
         ui.label(
             RichText::new(format!("● {label}  [{mode}]"))
@@ -627,7 +673,7 @@ fn remote_terminals(state: &mut State, ui: &mut Ui) {
         let label = if state.ui.remote_form_open {
             "Close form"
         } else {
-            "＋ Add remote"
+            "+ Add remote"
         };
         if ui.button(label).clicked() {
             state.ui.remote_form_open = !state.ui.remote_form_open;
@@ -785,9 +831,18 @@ fn tabs_bar(state: &mut State, ui: &mut Ui) {
         })
         .collect();
 
+    // Saved remotes, for the one-click connect buttons to the right of `+`.
+    let remotes: Vec<(usize, String)> = state
+        .remote_terminals
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (i, r.host.clone()))
+        .collect();
+
     let mut to_select: Option<usize> = None;
     let mut to_close: Option<usize> = None;
     let mut add_new = false;
+    let mut connect_remote: Option<usize> = None;
 
     ui.horizontal(|ui| {
         for (i, leaf) in labels.iter().enumerate() {
@@ -803,6 +858,18 @@ fn tabs_bar(state: &mut State, ui: &mut Ui) {
         if ui.button("+").on_hover_text("New tab").clicked() {
             add_new = true;
         }
+        // One-click SSH connect per saved remote, e.g. `ssh 0 192.168.1.10`.
+        // Connects the active tab — same as typing `ssh <index>`.
+        for (i, host) in &remotes {
+            ui.separator();
+            if ui
+                .button(format!("+ ssh {i} {host}"))
+                .on_hover_text("Connect this tab to the saved remote")
+                .clicked()
+            {
+                connect_remote = Some(*i);
+            }
+        }
     });
 
     if let Some(i) = to_select {
@@ -813,6 +880,9 @@ fn tabs_bar(state: &mut State, ui: &mut Ui) {
     }
     if add_new {
         state.add_tab();
+    }
+    if let Some(i) = connect_remote {
+        state.connect_remote(i);
     }
 }
 

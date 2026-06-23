@@ -33,6 +33,11 @@ pub fn handle_cmd(state: &mut State, cmd: &str, input: &str, args: &str) {
             state.push_out("(use the window close button to exit)", OutType::StdErr);
         }
 
+        // `ssh <index>` connects the active tab to a saved remote (same as the
+        // per-remote buttons in the tab strip); `ssh [user@]host[:port]`
+        // connects to a freeform target using a keyring-stored password.
+        "ssh" => state.cmd_ssh(args),
+
         "sync" => {
             // Delegate to the shared implementation. Clone `cwd` so the
             // sink closure can borrow `state` mutably for `push_out` without

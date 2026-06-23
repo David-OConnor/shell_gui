@@ -624,19 +624,49 @@ impl State {
     }
 
     /// Connect the active tab to the saved remote at `idx`. The password comes
-    /// from the OS keyring (saved when the remote was added); a missing one is
-    /// reported rather than prompting (the GUI can't host a blocking prompt
-    /// mid-frame — the user re-saves it via the Remote panel form). Blocks the
-    /// UI thread for the duration of the connect, like a shelled-out command.
+    /// from the OS keyring (saved when the remote was added).
     pub fn connect_remote(&mut self, idx: usize) {
         let Some(rt) = self.remote_terminals.get(idx) else {
+            self.push_out(
+                format!("ssh: no saved remote at index {idx}"),
+                OutType::StdErr,
+            );
             return;
         };
         let (host, port, user) = (rt.host.clone(), rt.port, rt.username.clone());
+        self.connect_with(host, port, user);
+    }
 
+    /// `ssh <index>` (a saved remote) or `ssh [user@]host[:port] [port]` (a
+    /// freeform target). Mirrors the CLI's `ssh` built-in so the typed command
+    /// behaves the same in both frontends.
+    pub fn cmd_ssh(&mut self, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            self.push_out(
+                "ssh: usage: ssh [user@]host [port]  |  ssh <saved-index>",
+                OutType::StdErr,
+            );
+            return;
+        }
+        // A bare number selects a saved remote by its index.
+        if let Ok(idx) = args.parse::<usize>() {
+            self.connect_remote(idx);
+            return;
+        }
+        let (host, port, user) = parse_remote_spec(args);
+        self.connect_with(host, port, user);
+    }
+
+    /// Shared connect path. Pulls the password from the OS keyring (a missing
+    /// one is reported rather than prompting — the GUI can't host a blocking
+    /// prompt mid-frame, so the user saves it via the Remote panel form first).
+    /// Blocks the UI thread for the duration of the connect, like a shelled-out
+    /// command. Replaces any existing session on the active tab.
+    fn connect_with(&mut self, host: String, port: u16, user: String) {
         let Some(password) = secrets::get_password(&host, port, &user) else {
             self.push_out(
-                format!("ssh: no saved password for {user}@{host}; edit the remote to add one"),
+                format!("ssh: no saved password for {user}@{host}; add it in the Remote panel"),
                 OutType::StdErr,
             );
             return;
@@ -646,7 +676,10 @@ impl State {
         match ssh::connect(&host, port, &user, &password) {
             Ok(session) => {
                 let i = self.ui.active_tab;
-                self.active_remote[i] = Some(session);
+                // Drop any prior session on this tab before replacing it.
+                if let Some(old) = self.active_remote[i].replace(session) {
+                    old.disconnect();
+                }
                 self.push_out(format!("Connected to {user}@{host}"), OutType::StdOut);
             }
             Err(e) => self.push_out(format!("ssh: {e}"), OutType::StdErr),
@@ -813,6 +846,33 @@ impl State {
         self.ui.remote_password.clear();
         Ok(())
     }
+}
+
+/// The OS account name, used as the default SSH username when `ssh host` omits
+/// `user@`. Mirrors the CLI's helper in `shell::commands`.
+fn default_user() -> String {
+    env::var("USERNAME")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_else(|_| "root".to_string())
+}
+
+/// Parse a `[user@]host[:port] [port]` spec into `(host, port, user)`. The
+/// optional trailing port argument wins over a `:port` suffix; defaults are the
+/// OS user and port 22. Mirrors the CLI's `parse_remote_spec`.
+fn parse_remote_spec(spec: &str) -> (String, u16, String) {
+    let mut parts = spec.split_whitespace();
+    let target = parts.next().unwrap_or("");
+    let port_arg = parts.next().and_then(|p| p.parse().ok());
+
+    let (user, hostport) = match target.split_once('@') {
+        Some((u, hp)) => (u.to_string(), hp),
+        None => (default_user(), target),
+    };
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(22)),
+        None => (hostport.to_string(), 22),
+    };
+    (host, port_arg.unwrap_or(port), user)
 }
 
 impl eframe::App for State {
