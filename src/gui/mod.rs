@@ -277,22 +277,22 @@ fn cmd_history(state: &mut State, ui: &mut Ui) {
 /// - macOS: `open <path>`.
 /// - Other (Linux/BSD): `xdg-open <path>`.
 fn open_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
-    use std::process::Command;
+    use shell::quiet_command;
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = Command::new("cmd");
+        let mut c = quiet_command("cmd");
         c.args(["/C", "start", ""]).arg(path);
         c
     };
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = Command::new("open");
+        let mut c = quiet_command("open");
         c.arg(path);
         c
     };
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let mut cmd = {
-        let mut c = Command::new("xdg-open");
+        let mut c = quiet_command("xdg-open");
         c.arg(path);
         c
     };

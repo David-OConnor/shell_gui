@@ -1,8 +1,8 @@
 //! Misc utility functionality.
 
-use std::{fs, io, path::Path, process::Command};
+use std::{fs, io, path::Path};
 
-use shell::{commands, path_from_args};
+use shell::{commands, path_from_args, quiet_command};
 
 use crate::{OutType, out_type_for, state::State, util};
 
@@ -180,12 +180,12 @@ pub fn handle_cmd(state: &mut State, cmd: &str, input: &str, args: &str) {
 
         _ => {
             let result = if cfg!(windows) {
-                Command::new("pwsh")
+                quiet_command("pwsh")
                     .args(["-NoProfile", "-NoLogo", "-Command", input])
                     .current_dir(state.cwd())
                     .output()
             } else {
-                Command::new("sh")
+                quiet_command("sh")
                     .args(["-c", input])
                     .current_dir(state.cwd())
                     .output()

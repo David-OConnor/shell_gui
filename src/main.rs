@@ -9,13 +9,10 @@ mod gui;
 mod state;
 mod util;
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use shell::{HistoryItem, NavState, RecentDir, commands::OutKind, save_data};
+use shell::{HistoryItem, NavState, RecentDir, commands::OutKind, quiet_command, save_data};
 use state::State;
 
 use crate::{
@@ -133,12 +130,12 @@ pub fn run_command(state: &mut State, input: &str) {
             {
                 Some((text, dir)) => {
                     let result = if cfg!(windows) {
-                        Command::new("pwsh")
+                        quiet_command("pwsh")
                             .args(["-NoProfile", "-NoLogo", "-Command", &text])
                             .current_dir(&dir)
                             .output()
                     } else {
-                        Command::new("sh")
+                        quiet_command("sh")
                             .args(["-c", text.as_str()])
                             .current_dir(&dir)
                             .output()
@@ -207,6 +204,7 @@ pub fn run_command(state: &mut State, input: &str) {
 fn main() {
     let state_path =
         save_data::default_path().unwrap_or_else(|| PathBuf::from(save_data::FILENAME));
+
     let state = State::load(state_path).unwrap_or_default();
 
     // Reopen at the size the user left the window, falling back to the
@@ -215,6 +213,7 @@ fn main() {
         .window_size
         .map(|ws| [ws.x, ws.y])
         .unwrap_or([WINDOW_WIDTH, WINDOW_HEIGHT]);
+
     let options = eframe::NativeOptions {
         // Floor the window width at the central column's minimum so the side
         // panels can always honor [MIN_CENTRAL_WIDTH]; below this the central
