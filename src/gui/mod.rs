@@ -24,6 +24,15 @@ use crate::{OutType, ansi, render_with_tilde, run_command, state::State};
 pub const WINDOW_WIDTH: f32 = 1400.;
 pub const WINDOW_HEIGHT: f32 = 900.;
 
+/// Default font size (points) for the terminal input/output panes, used when
+/// the state file has no saved `FONT_SIZE`. Matches egui's default monospace
+/// size so a fresh install looks unchanged.
+pub const DEFAULT_FONT_SIZE: f32 = 13.;
+/// Bounds the +/- font-size buttons clamp to, so the panes can't be shrunk
+/// to an unreadable size or blown up past the window.
+pub const MIN_FONT_SIZE: f32 = 6.;
+pub const MAX_FONT_SIZE: f32 = 48.;
+
 /// Bookmarks column. Narrower than the other side columns: bookmark paths are
 /// truncated to [BOOKMARK_MAX_LEN] chars, so this only needs to fit the
 /// `"<i>: "` prefix plus that path and the trailing `x` button.
@@ -347,6 +356,20 @@ fn apply_action(state: &mut State, action: Option<ListAction>) {
     }
 }
 
+/// Override the `Monospace` text style's size on `ui` so the terminal panes
+/// render at the user-chosen font size. Both panes resolve `Monospace` (the
+/// output pane for its layout jobs, the input row for its prompt labels and
+/// `TextEdit`), so setting it here is enough to scale all the terminal text.
+fn set_mono_size(ui: &mut Ui, size: f32) {
+    if let Some(font) = ui
+        .style_mut()
+        .text_styles
+        .get_mut(&egui::TextStyle::Monospace)
+    {
+        font.size = size;
+    }
+}
+
 /// The "terminal" output pane: scrolls, sticks to the bottom so the latest
 /// line stays in view, and colours rows by stream kind.
 fn term_out(state: &mut State, ui: &mut Ui) {
@@ -356,6 +379,7 @@ fn term_out(state: &mut State, ui: &mut Ui) {
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            set_mono_size(ui, state.font_size);
             let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
             let active = state.ui.active_tab;
             for item in &state.ui.out[active] {
@@ -379,6 +403,9 @@ fn term_out(state: &mut State, ui: &mut Ui) {
 /// a recent dir via Left/Right, a green ` his N` / ` cd N` label is
 /// inserted between the cwd and the `$`.
 fn term_in(state: &mut State, ui: &mut Ui) {
+    // Scale the prompt labels and input box with the chosen font size. Both
+    // resolve `Monospace`, so overriding it on this panel's `ui` is enough.
+    set_mono_size(ui, state.font_size);
     let active = state.ui.active_tab;
     let (his_cursor, cd_cursor) = state.active_nav_cursors();
     let cwd_part = state.cwd_display();
@@ -839,12 +866,35 @@ fn tabs_bar(state: &mut State, ui: &mut Ui) {
         .map(|(i, r)| (i, r.host.clone()))
         .collect();
 
+    let font_size = state.font_size;
+
     let mut to_select: Option<usize> = None;
     let mut to_close: Option<usize> = None;
     let mut add_new = false;
     let mut connect_remote: Option<usize> = None;
+    let mut font_delta = 0.0_f32;
 
     ui.horizontal(|ui| {
+        // Font-size controls sit to the left of the tab strip: a label, the
+        // current size, then +/- buttons that scale the terminal panes.
+        ui.label("Font size: ");
+        ui.label(format!("{}", font_size.round() as i32));
+        if ui
+            .small_button("+")
+            .on_hover_text("Increase terminal font size")
+            .clicked()
+        {
+            font_delta = 1.0;
+        }
+        if ui
+            .small_button("-")
+            .on_hover_text("Decrease terminal font size")
+            .clicked()
+        {
+            font_delta = -1.0;
+        }
+        ui.separator();
+
         for (i, leaf) in labels.iter().enumerate() {
             let text = format!("{i}: {leaf}");
             if ui.selectable_label(i == active, text).clicked() {
@@ -872,6 +922,9 @@ fn tabs_bar(state: &mut State, ui: &mut Ui) {
         }
     });
 
+    if font_delta != 0.0 {
+        state.adjust_font_size(font_delta);
+    }
     if let Some(i) = to_select {
         state.select_tab(i);
     }

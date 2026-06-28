@@ -131,6 +131,9 @@ pub struct State {
     /// `save` persists the size the user left the window at. `None` until the
     /// first frame reports a size (and on a fresh file with no saved value).
     pub window_size: Option<WindowSize>,
+    /// Font size (in points) for the terminal input/output panes, adjusted via
+    /// the +/- buttons on the tab strip and persisted to the state file.
+    pub font_size: f32,
 }
 
 impl Default for State {
@@ -151,6 +154,7 @@ impl Default for State {
                 .unwrap_or_else(|| PathBuf::from(save_data::FILENAME)),
             branch: vec![branch],
             window_size: None,
+            font_size: gui::DEFAULT_FONT_SIZE,
         };
         s.refresh_all_filters();
         s.refresh_browser_files();
@@ -255,8 +259,20 @@ impl State {
             &self.ui.panel_vis,
             self.window_size,
             &open_tabs,
+            Some(self.font_size),
             &self.state_path,
         )
+    }
+
+    /// Adjust the terminal-pane font size by `delta` points, clamped to a
+    /// sane range, and persist the change. Wired to the +/- buttons on the
+    /// tab strip.
+    pub fn adjust_font_size(&mut self, delta: f32) {
+        let next = (self.font_size + delta).clamp(gui::MIN_FONT_SIZE, gui::MAX_FONT_SIZE);
+        if next != self.font_size {
+            self.font_size = next;
+            let _ = self.save();
+        }
     }
 
     pub fn load(path: PathBuf) -> io::Result<Self> {
@@ -307,6 +323,7 @@ impl State {
             state_path: path,
             branch,
             window_size: loaded.window_size,
+            font_size: loaded.font_size.unwrap_or(gui::DEFAULT_FONT_SIZE),
         };
         s.refresh_all_filters();
         s.refresh_browser_files();
